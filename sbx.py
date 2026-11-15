@@ -26,14 +26,18 @@
   sbx up | down | restart | status | log -f
   sbx enable | disable                           # автозапуск при загрузке
   sbx mode tun|proxy    sbx route ru|global
+  sbx rule proxy example.ru | direct example.com | rm example.ru   # свои домены
+  sbx set exclude --add 203.0.113.7 | --rm 203.0.113.7             # элемент списка
   sbx add 'vless://…'                            # одиночный сервер без подписки
   sbx probe [-a]                                 # проверка рядом с другим VPN, без перехвата
 """
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import os
+import pwd
 import re
 import secrets
 import shutil
@@ -49,7 +53,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 HOME = Path.home()
 CONF_DIR = HOME / ".config/sbx"
@@ -101,6 +105,9 @@ DEFAULT_STATE = {
         "tun_name": "sbx0",
         "exclude": DEFAULT_EXCLUDE,
         "bypass_sports": ["udp:51820", "tcp:443"],   # ответы своих серверов — мимо TUN
+        "bypass_users": [],         # весь трафик этих пользователей — мимо TUN (например, playit)
+        "proxy_domains": [],        # домены (с поддоменами) — всегда через VPN, даже при route ru
+        "direct_domains": [],       # домены (с поддоменами) — всегда напрямую
         "dns_remote": "https://1.1.1.1/dns-query",
         "dns_direct": "77.88.8.8",
         "auto_exclude": "",         # regex: какие серверы не брать в auto
@@ -649,6 +656,16 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
         {"ip_cidr": [cfg_s["dns_direct"] + "/32"], "outbound": "direct"},
         {"ip_is_private": True, "outbound": "direct"},
     ]
+    def domains(key):
+        return sorted({d for d in map(norm_domain, cfg_s.get(key, [])) if d})
+    proxy_d, direct_d = domains("proxy_domains"), domains("direct_domains")
+    # свои домены — раньше правил route ru: .ru из proxy_domains всё равно уходит в VPN
+    if direct_d:
+        dns["rules"].append({"domain_suffix": direct_d, "server": "dns-direct"})
+        rules.append({"domain_suffix": direct_d, "outbound": "direct"})
+    if proxy_d:
+        dns["rules"].append({"domain_suffix": proxy_d, "server": "dns-remote"})
+        rules.append({"domain_suffix": proxy_d, "outbound": "proxy"})
     rule_sets = []
     if ru:
         rule_sets = [{"type": "local", "tag": t, "format": "binary", "path": str(p)}
@@ -770,6 +787,13 @@ def unit_text(st):
         proto, _, port = spec.partition(":")
         for fam in ("-4", "-6"):
             rules.append(f"{fam} rule %s priority 8990 ipproto {proto} sport {port} lookup main")
+    for name in st["settings"].get("bypass_users", []):
+        try:
+            uid = pwd.getpwnam(name).pw_uid if not name.isdigit() else int(name)
+        except KeyError:
+            continue
+        for fam in ("-4", "-6"):
+            rules.append(f"{fam} rule %s priority 8990 uidrange {uid}-{uid} lookup main")
     add = "\n".join(f"ExecStartPre=-+/usr/bin/ip {r % 'add'}" for r in rules)
     units = st["settings"].get("before_units") or []
     # сервисы, которым нужен VPN (боты и т.п.), стартуют уже после туннеля
@@ -1452,6 +1476,61 @@ def cmd_route(st, a):
     print(st["settings"]["route"])
 
 
+DOMAIN_KEYS = ("proxy_domains", "direct_domains")
+DOMAIN_RE = re.compile(r"^(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)*[a-z0-9-]{1,63}$")
+
+
+def norm_domain(d):
+    """«*.Example.RU.» → «example.ru»: правило domain_suffix и так ловит поддомены."""
+    return d.strip().lower().removeprefix("*.").strip(".")
+
+
+def norm_item(key, v):
+    """Привести элемент списка к виду, в котором он хранится; мусор — сразу ошибка,
+    а не отказ sing-box при следующем apply."""
+    v = v.strip()
+    if key == "exclude":
+        try:
+            return str(ipaddress.ip_network(v, strict=False))
+        except ValueError:
+            die(f"exclude — только IP или подсеть, а не «{v}». "
+                f"Домен мимо VPN: sbx rule direct {norm_domain(v) or v}")
+    if key in DOMAIN_KEYS:
+        d = norm_domain(v)
+        try:
+            ipaddress.ip_network(d, strict=False)
+        except ValueError:
+            pass
+        else:
+            die(f"«{v}» — адрес, а не домен. Мимо VPN: sbx set exclude --add {d}")
+        try:
+            d = d.encode("idna").decode() if not d.isascii() else d
+        except UnicodeError:
+            die(f"не домен: «{v}»")
+        if not DOMAIN_RE.match(d):
+            die(f"не домен: «{v}»")
+        return d
+    return v
+
+
+def split_items(key, values):
+    out = []
+    for chunk in values or []:
+        out += [norm_item(key, x) for x in chunk.split(",") if x.strip()]
+    return list(dict.fromkeys(out))
+
+
+def commit_settings(st, changed):
+    """Проверить конфиг и только потом сохранить: отвергнутое sing-box в state.json не попадает."""
+    if all_servers(st):
+        apply(st)
+    save_state(st)
+    if set(changed) & {"bypass_sports", "bypass_users", "before_units"}:
+        install_units(st)
+        if set(changed) & {"bypass_sports", "bypass_users"}:
+            print("  правила обхода применятся при следующем sbx restart")
+
+
 def cmd_set(st, a):
     s = st["settings"]
     if not a.key:
@@ -1461,24 +1540,69 @@ def cmd_set(st, a):
         return
     if a.key not in s:
         die(f"нет настройки {a.key}")
-    if a.value is None:
-        print(json.dumps(s[a.key], ensure_ascii=False))
-        return
     cur = s[a.key]
-    if isinstance(cur, list):
-        val = [x for x in a.value.split(",") if x] if a.value != "default" else DEFAULT_STATE["settings"][a.key]
+    if a.add or a.rm:
+        if not isinstance(cur, list):
+            die(f"{a.key} — не список: --add/--rm только для списков")
+        if a.value is not None:
+            die("либо значение целиком, либо --add/--rm")
+        add, rm = split_items(a.key, a.add), split_items(a.key, a.rm)
+        for x in rm:
+            if x not in cur:
+                warn(f"{x} нет в {a.key}")
+        for x in add:
+            if x in cur:
+                warn(f"{x} уже в {a.key}")
+        val = [x for x in cur if x not in rm] + [x for x in add if x not in cur]
+    elif a.value is None:
+        print(json.dumps(cur, ensure_ascii=False))
+        return
+    elif isinstance(cur, list):
+        if a.value == "default":
+            val = DEFAULT_STATE["settings"][a.key]
+        else:
+            val = split_items(a.key, [a.value])
     elif isinstance(cur, int):
         val = int(a.value)
     else:
         val = a.value
     s[a.key] = val
-    save_state(st)
-    if a.key in ("bypass_sports", "before_units"):
-        install_units(st)
-        if a.key == "bypass_sports":
-            print("  правила обхода применятся при следующем sbx restart")
-    apply(st)
+    commit_settings(st, [a.key])
     print(f"{a.key} = {json.dumps(val, ensure_ascii=False)}")
+
+
+def cmd_rule(st, a):
+    s = st["settings"]
+    if a.action in (None, "ls"):
+        if a.domains:
+            die("sbx rule ls — без аргументов")
+        for key, title in (("proxy_domains", "через VPN"), ("direct_domains", "напрямую")):
+            items = s.get(key, [])
+            print(f"{title} ({key}): {', '.join(items) if items else '—'}")
+        print(f"остальное: route {s['route']}"
+              + (" (российское напрямую, прочее через VPN)" if s["route"] == "ru" else " (всё через VPN)"))
+        return
+    if not a.domains:
+        die(f"sbx rule {a.action} ДОМЕН…")
+    doms = split_items("proxy_domains", a.domains)
+    if a.action == "rm":
+        known = {d for k in DOMAIN_KEYS for d in s.get(k, [])}
+        for d in doms:
+            if d not in known:
+                warn(f"{d}: такого правила нет")
+        doms = [d for d in doms if d in known]
+        if not doms:
+            return
+        for key in DOMAIN_KEYS:
+            s[key] = [d for d in s.get(key, []) if d not in doms]
+    else:
+        key = "proxy_domains" if a.action == "proxy" else "direct_domains"
+        other = DOMAIN_KEYS[1] if key == DOMAIN_KEYS[0] else DOMAIN_KEYS[0]
+        s[other] = [d for d in s.get(other, []) if d not in doms]
+        s[key] = list(dict.fromkeys([*s.get(key, []), *doms]))
+    commit_settings(st, list(DOMAIN_KEYS))
+    where = {"proxy": "через VPN", "direct": "напрямую", "rm": "по общим правилам"}[a.action]
+    print(f"✓ {', '.join(doms)} — {where}")
 
 
 def cmd_install(st, a):
@@ -1581,9 +1705,15 @@ def main():
     x = sp.add_parser("route", help="ru — российское напрямую, global — всё через VPN")
     x.add_argument("route", nargs="?", choices=["ru", "global"])
     x.set_defaults(func=cmd_route)
-    x = sp.add_parser("set", help="настройки: sbx set [ключ [значение]]")
+    x = sp.add_parser("rule", help="свои домены: ls | proxy ДОМЕН… | direct ДОМЕН… | rm ДОМЕН…")
+    x.add_argument("action", nargs="?", choices=["ls", "proxy", "direct", "rm"])
+    x.add_argument("domains", nargs="*", metavar="домен")
+    x.set_defaults(func=cmd_rule)
+    x = sp.add_parser("set", help="настройки: sbx set [ключ [значение | --add X | --rm X]]")
     x.add_argument("key", nargs="?")
     x.add_argument("value", nargs="?")
+    x.add_argument("--add", action="append", metavar="X[,Y]", help="добавить в список-настройку")
+    x.add_argument("--rm", action="append", metavar="X[,Y]", help="убрать из списка-настройки")
     x.set_defaults(func=cmd_set)
 
     x = sp.add_parser("config", help="проверить сгенерированный конфиг")
