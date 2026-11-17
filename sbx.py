@@ -35,11 +35,12 @@
 """
 import argparse
 import base64
+import csv
 import hashlib
 import ipaddress
 import json
 import os
-import pwd
+import platform
 import re
 import secrets
 import shutil
@@ -52,19 +53,40 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 __version__ = "1.2.0"
 
 HOME = Path.home()
-CONF_DIR = HOME / ".config/sbx"
+IS_WIN = os.name == "nt"
+
+
+def platform_paths(home, env, windows):
+    if windows:
+        app = Path(env.get("APPDATA") or home / "AppData/Roaming") / "sbx"
+        local = Path(env.get("LOCALAPPDATA") or home / "AppData/Local") / "sbx"
+        config = Path(env.get("SBX_HOME") or app)
+        return config, config / "work" if env.get("SBX_HOME") else local / "work", local / "core"
+    config = Path(env.get("SBX_HOME") or home / ".config/sbx")
+    return config, config / "work" if env.get("SBX_HOME") else home / ".local/state/sbx", None
+
+
+def sing_box_path(env, windows, core):
+    return env.get("SBX_SING_BOX") or (str(core / "sing-box.exe") if windows else
+                                       shutil.which("sing-box") or "/usr/bin/sing-box")
+
+
+CONF_DIR, WORK_DIR, CORE_DIR = platform_paths(HOME, os.environ, IS_WIN)
 STATE_FILE = CONF_DIR / "state.json"
 SUBS_DIR = CONF_DIR / "subs"
 RULESET_DIR = CONF_DIR / "rulesets"
 CONFIG_FILE = CONF_DIR / "config.json"
-WORK_DIR = HOME / ".local/state/sbx"
-SING_BOX = shutil.which("sing-box") or "/usr/bin/sing-box"
+SING_BOX = sing_box_path(os.environ, IS_WIN, CORE_DIR)
+LOG_FILE = WORK_DIR / "sing-box.log"
 UNIT = "sbx.service"
 UNIT_DIR = Path("/etc/systemd/system")
 PROBE_IF = "sbx-probe"
@@ -137,7 +159,7 @@ def warn(msg):
 def load_state():
     st = json.loads(json.dumps(DEFAULT_STATE))
     if STATE_FILE.exists():
-        saved = json.loads(STATE_FILE.read_text())
+        saved = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         settings = {**st["settings"], **saved.get("settings", {})}
         st.update(saved)
         st["settings"] = settings
@@ -149,25 +171,38 @@ def load_state():
 def write_private(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        if not IS_WIN:
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
 
 
 def save_state(st):
     CONF_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(CONF_DIR, 0o700)
+    if not IS_WIN:
+        os.chmod(CONF_DIR, 0o700)
     write_private(STATE_FILE, json.dumps(st, ensure_ascii=False, indent=2))
 
 
 def hwid():
     """Как у Koala Clash / Happ-подобных клиентов: sha256(machine-id)[:16] — то же устройство в панели."""
-    mid = Path("/etc/machine-id").read_text().strip()
+    if IS_WIN:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography",
+                            access=winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+            mid = winreg.QueryValueEx(key, "MachineGuid")[0]
+    else:
+        mid = Path("/etc/machine-id").read_text().strip()
     return hashlib.sha256(mid.encode()).hexdigest()[:16]
 
 
 def os_version():
+    if IS_WIN:
+        return platform.version()
     try:
         rel = Path("/etc/os-release").read_text()
         name = re.search(r'^NAME="?([^"\n]+)', rel, re.M)
@@ -199,8 +234,116 @@ def unit_prop(prop):
     return r.stdout.strip()
 
 
-def is_active():
+def is_active(st):
+    if IS_WIN:
+        return task_running() and api_up(st)
     return unit_prop("ActiveState") == "active"
+
+
+def release_json(url):
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                               "User-Agent": f"sbx/{__version__}"})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return json.load(response)
+
+
+def download_asset(asset, path, *, require_digest=False):
+    digest = asset.get("digest")
+    if (digest or require_digest) and not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest or ""):
+        raise ValueError("нет допустимой контрольной суммы SHA-256")
+    url = asset["browser_download_url"]
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ValueError("загрузка релизов разрешена только по HTTPS")
+    sha = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=30) as response, path.open("wb") as target:
+        for block in iter(lambda: response.read(1024 * 1024), b""):
+            sha.update(block)
+            target.write(block)
+    if digest and "sha256:" + sha.hexdigest() != digest.lower():
+        raise ValueError("контрольная сумма SHA-256 не совпала")
+
+
+def windows_arch():
+    arch = {"amd64": "amd64", "x86_64": "amd64", "arm64": "arm64", "aarch64": "arm64",
+            "x86": "386", "i386": "386"}.get(platform.machine().lower())
+    if not arch:
+        raise ValueError(f"неподдерживаемая архитектура Windows: {platform.machine()}")
+    return arch
+
+
+def install_core(directory):
+    release = release_json("https://api.github.com/repos/SagerNet/sing-box/releases/latest")
+    version = release["tag_name"].removeprefix("v")
+    filename = f"sing-box-{version}-windows-{windows_arch()}.zip"
+    asset = next((entry for entry in release["assets"] if entry["name"] == filename), None)
+    if not asset:
+        raise ValueError(f"в релизе sing-box нет {filename}")
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=directory) as tmp:
+        archive = Path(tmp) / "core.zip"
+        download_asset(asset, archive, require_digest=True)
+        with zipfile.ZipFile(archive) as source:
+            files = {name: [entry for entry in source.namelist() if entry.rsplit("/", 1)[-1] == name]
+                     for name in ("sing-box.exe", "libcronet.dll")}
+            if len(files["sing-box.exe"]) != 1 or len(files["libcronet.dll"]) > 1:
+                raise ValueError("неожиданный состав архива sing-box")
+            for name, entries in files.items():
+                if entries:
+                    with source.open(entries[0]) as infile, (Path(tmp) / name).open("wb") as outfile:
+                        shutil.copyfileobj(infile, outfile)
+            for name in ("libcronet.dll", "sing-box.exe"):
+                if files[name]:
+                    os.replace(Path(tmp) / name, directory / name)
+                elif (directory / name).exists():
+                    (directory / name).unlink()
+    return directory / "sing-box.exe"
+
+
+def core_path():
+    if IS_WIN and not os.environ.get("SBX_SING_BOX") and not Path(SING_BOX).exists():
+        install_core(CORE_DIR)
+    return SING_BOX
+
+
+def cmd_core(st, a):
+    if not IS_WIN:
+        die("core install доступна в Windows; в Linux установите sing-box из пакета дистрибутива")
+    if os.environ.get("SBX_SING_BOX"):
+        die("задан SBX_SING_BOX; снимите переопределение для установки ядра")
+    print(f"✓ ядро установлено: {install_core(CORE_DIR)}")
+
+
+def interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def launch_command(argv):
+    prefix = [] if getattr(sys, "frozen", False) else [str(Path(sys.argv[0]).absolute())]
+    return [sys.executable, *prefix, *argv]
+
+
+def windows_admin():
+    import ctypes
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+def request_windows_admin(argv):
+    import ctypes
+    exe, *args = launch_command(argv)
+    execute = ctypes.windll.shell32.ShellExecuteW
+    execute.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                        ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+    execute.restype = ctypes.c_void_p
+    result = execute(None, "runas", exe, subprocess.list2cmdline(args), str(Path.cwd()), 1)
+    if not result or result <= 32:
+        die("не удалось получить права администратора (UAC)")
+
+
+def require_windows_admin(argv=None):
+    if IS_WIN and not windows_admin():
+        request_windows_admin(sys.argv[1:] if argv is None else argv)
+        return False
+    return True
 
 
 def human_bytes(n):
@@ -528,13 +671,13 @@ def sub_file(name):
 
 def load_sub_cache(name):
     f = sub_file(name)
-    return json.loads(f.read_text()) if f.exists() else {"servers": [], "meta": {}}
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {"servers": [], "meta": {}}
 
 
 def fetch_sub(st, sub):
     headers = {"User-Agent": sub.get("ua") or st["settings"]["ua"], "Accept": "*/*"}
     if sub.get("hwid", True):
-        headers.update({"x-hwid": hwid(), "x-device-os": "Linux",
+        headers.update({"x-hwid": hwid(), "x-device-os": "Windows" if IS_WIN else "Linux",
                         "x-ver-os": os_version(), "x-device-model": socket.gethostname()})
     req = urllib.request.Request(sub["url"], headers=headers)
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -800,8 +943,11 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
         *({**s["outbound"], "tag": s["tag"]} for s in servers),
         {"type": "direct", "tag": "direct"},
     ]
+    log = {"level": cfg_s["log_level"], "timestamp": True}
+    if IS_WIN:
+        log["output"] = str(LOG_FILE)
     return {
-        "log": {"level": cfg_s["log_level"], "timestamp": True},
+        "log": log,
         "dns": dns,
         "inbounds": inbounds,
         "outbounds": outbounds,
@@ -817,7 +963,7 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
 
 
 def check_config(path):
-    r = run([SING_BOX, "check", "-c", str(path)], check=False, capture_output=True)
+    r = run([core_path(), "check", "-c", str(path)], check=False, capture_output=True)
     return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
@@ -827,22 +973,32 @@ def apply(st, reload=True, quiet=False):
     if not servers:
         die("серверов нет: добавьте подписку (sbx sub add) или сервер (sbx add)")
     text = json.dumps(build_config(st, servers), ensure_ascii=False, indent=2)
-    old = CONFIG_FILE.read_text() if CONFIG_FILE.exists() else None
+    old = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else None
     if text == old:
         return False
-    tmp = CONF_DIR / ".config.check.json"
-    write_private(tmp, text)
-    ok, err = check_config(tmp)
-    if not ok:
-        tmp.unlink()
-        die(f"sing-box отверг конфиг:\n{err}")
-    os.replace(tmp, CONFIG_FILE)
-    if reload and is_active():
-        pid = int(unit_prop("MainPID") or 0)
-        if pid:
-            os.kill(pid, signal.SIGHUP)
-            if not quiet:
-                print("↻ конфиг перечитан")
+    if IS_WIN:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=CONF_DIR) as directory:
+        tmp = Path(directory) / "config.json"
+        write_private(tmp, text)
+        ok, err = check_config(tmp)
+        if not ok:
+            die(f"sing-box отверг конфиг:\n{err}")
+        os.replace(tmp, CONFIG_FILE)
+    if reload and is_active(st):
+        if IS_WIN:
+            if windows_admin():
+                publish_windows_config(st)
+                service_action("restart")
+            elif not quiet:
+                warn("конфиг сохранён; примените к задаче SYSTEM через sbx restart (UAC)")
+        else:
+            pid = int(unit_prop("MainPID") or 0)
+            if pid:
+                os.kill(pid, signal.SIGHUP)
+                if not quiet:
+                    print("↻ конфиг перечитан")
     return True
 
 
@@ -882,6 +1038,8 @@ def current_node(st):
 # ─── systemd ──────────────────────────────────────────────────────────────────
 
 def unit_text(st):
+    import pwd
+
     user = os.environ.get("SUDO_USER") or os.environ.get("USER") or HOME.name
     rules = []
     for spec in st["settings"]["bypass_sports"]:
@@ -965,6 +1123,8 @@ def sudo_write(path, text):
 
 
 def install_units(st, quiet=False):
+    if IS_WIN:
+        return install_windows_tasks(st, quiet)
     svc, tmr = timer_units()
     files = {UNIT_DIR / UNIT: unit_text(st), UNIT_DIR / "sbx-update.service": svc,
              UNIT_DIR / "sbx-update.timer": tmr}
@@ -983,9 +1143,202 @@ def install_units(st, quiet=False):
 
 def foreign_tun():
     """Другой VPN с TUN (Koala Clash / mihomo и т.п.) — маршруты подерутся."""
+    if IS_WIN:
+        return []
     r = run(["pgrep", "-a", "-f", "mihomo|clash-meta|xray|hiddify|nekobox|throne"],
             check=False, capture_output=True)
     return [l for l in r.stdout.splitlines() if "sbx" not in l and "pgrep" not in l]
+
+
+TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+
+
+def task_call(action, name="sbx", *args, check=True, capture=True):
+    return run(["schtasks", f"/{action}", "/tn", name, *args], check=check, capture_output=capture)
+
+
+def task_running():
+    result = task_call("query", "sbx", "/fo", "csv", "/nh", check=False)
+    if result.returncode:
+        return False
+    row = next(csv.reader(result.stdout.splitlines()), [])
+    if row and row[-1].lower() == "running":
+        return True
+    if not row or row[-1].lower() in {"ready", "disabled", "queued"}:
+        return False
+    result = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                  "[int](Get-ScheduledTask -TaskName 'sbx' -TaskPath '\\').State"],
+                 check=False, capture_output=True)
+    return result.returncode == 0 and result.stdout.strip() == "4"
+
+
+def task_definition(name):
+    result = task_call("query", name, "/xml", check=False)
+    return ET.fromstring(result.stdout) if not result.returncode else None
+
+
+def task_enabled(name):
+    root = task_definition(name)
+    if root is None:
+        return "disabled"
+    namespace = {"t": TASK_NS}
+    enabled = root.findtext("t:Settings/t:Enabled", "true", namespace)
+    if name == "sbx":
+        boot = root.find("t:Triggers/t:BootTrigger", namespace)
+        enabled = (boot.findtext("t:Enabled", "true", namespace)
+                   if boot is not None and enabled == "true" else "false")
+    return "enabled" if enabled == "true" else "disabled"
+
+
+def task_xml(command, sid, *, boot=None, work=None):
+    root = ET.Element("Task", xmlns=TASK_NS, version="1.2")
+
+    def element(parent, name, value):
+        ET.SubElement(parent, name).text = value
+
+    triggers = ET.SubElement(root, "Triggers")
+    if boot is not None:
+        element(ET.SubElement(triggers, "BootTrigger"), "Enabled", str(boot).lower())
+    else:
+        trigger = ET.SubElement(triggers, "TimeTrigger")
+        element(ET.SubElement(trigger, "Repetition"), "Interval", "PT6H")
+        element(trigger, "StartBoundary", time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 180)))
+    principal = ET.SubElement(ET.SubElement(root, "Principals"), "Principal", id="Author")
+    element(principal, "UserId", sid)
+    if boot is None:
+        element(principal, "LogonType", "InteractiveToken")
+    element(principal, "RunLevel", "HighestAvailable" if boot is not None else "LeastPrivilege")
+    settings = ET.SubElement(root, "Settings")
+    element(settings, "DisallowStartIfOnBatteries", "false")
+    element(settings, "StopIfGoingOnBatteries", "false")
+    element(settings, "ExecutionTimeLimit", "PT0S" if boot is not None else "PT30M")
+    action = ET.SubElement(ET.SubElement(root, "Actions", Context="Author"), "Exec")
+    element(action, "Command", command[0])
+    element(action, "Arguments", subprocess.list2cmdline(command[1:]))
+    if work is not None:
+        element(action, "WorkingDirectory", str(work))
+    return ET.tostring(root, encoding="utf-16", xml_declaration=True)
+
+
+def register_task(name, xml):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "task.xml"
+        path.write_bytes(xml)
+        task_call("create", name, "/xml", str(path), "/f", capture=False)
+
+
+def protected_runtime():
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion",
+                        access=winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+        program_files = Path(winreg.QueryValueEx(key, "ProgramFilesDir")[0])
+    return program_files / "SBX VPN" / "service"
+
+
+def published_config(cfg, runtime):
+    cfg["log"]["output"] = str(runtime / "sing-box.log")
+    for ruleset in cfg["route"]["rule_set"]:
+        tag = ruleset["tag"]
+        if not re.fullmatch(r"(?:geosite|geoip)-[a-z0-9][a-z0-9!@._-]*", tag):
+            raise ValueError("недопустимое имя rule-set для задачи SYSTEM")
+        name = f"{tag}.srs"
+        shutil.copyfile(RULESET_DIR / name, runtime / name)
+        ruleset["path"] = str(runtime / name)
+    return cfg
+
+
+def check_system_outbound(options):
+    if isinstance(options, dict):
+        for key, value in options.items():
+            if key != "path" or options.get("type") not in {"ws", "http", "httpupgrade"}:
+                if (key == "path" or key.endswith(("_file", "_path", "_directory", "_provider"))) and value:
+                    raise ValueError(f"параметр узла {key} с внешним файлом запрещён для задачи SYSTEM")
+            check_system_outbound(value)
+    elif isinstance(options, list):
+        for value in options:
+            check_system_outbound(value)
+
+
+def publish_windows_config(st):
+    runtime = protected_runtime()
+    servers = all_servers(st)
+    for server in servers:
+        check_system_outbound(server["outbound"])
+    cfg = published_config(build_config(st, servers), runtime)
+    with tempfile.TemporaryDirectory(dir=runtime) as directory:
+        candidate = Path(directory) / "config.json"
+        write_private(candidate, json.dumps(cfg, ensure_ascii=False, indent=2))
+        result = run([str(runtime / "sing-box.exe"), "check", "-c", str(candidate)],
+                     check=False, capture_output=True, cwd=runtime)
+        if result.returncode:
+            die(f"sing-box отверг конфиг задачи SYSTEM:\n{result.stderr or result.stdout}")
+        os.replace(candidate, runtime / "config.json")
+
+
+def register_windows_service(boot):
+    runtime = protected_runtime()
+    command = [str(runtime / "sing-box.exe"), "run", "-c", str(runtime / "config.json"),
+               "-D", str(runtime)]
+    register_task("sbx", task_xml(command, "S-1-5-18", boot=boot, work=runtime))
+
+
+def install_windows_tasks(st, quiet=False):
+    settings = st["settings"]
+    if not quiet and (settings["bypass_sports"] or settings["bypass_users"]):
+        warn("Windows: bypass_sports и bypass_users не применяются")
+    runtime = protected_runtime()
+    if not runtime.exists():
+        runtime.mkdir(parents=True)
+        run(["icacls", str(runtime), "/inheritance:r", "/grant:r",
+             "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", f"*{windows_user_sid()}:(OI)(CI)RX"],
+            capture_output=True)
+    # SYSTEM использует отдельное ядро и конфиг из защищённого каталога.
+    if not (runtime / "sing-box.exe").exists():
+        if override := os.environ.get("SBX_SING_BOX"):
+            core = Path(override).resolve(strict=True)
+            shutil.copyfile(core, runtime / "sing-box.exe")
+            if (dll := core.with_name("libcronet.dll")).is_file():
+                shutil.copyfile(dll, runtime / dll.name)
+        else:
+            install_core(runtime)
+    publish_windows_config(st)
+    if task_definition("sbx") is None:
+        register_windows_service(False)
+    if task_definition("sbx-update") is None:
+        register_windows_updater()
+
+
+def windows_user_sid():
+    return next(csv.reader(run(["whoami", "/user", "/fo", "csv", "/nh"],
+                               capture_output=True).stdout.splitlines()))[-1]
+
+
+def register_windows_updater():
+    register_task("sbx-update", task_xml(launch_command(["update", "-q"]), windows_user_sid()))
+
+
+def prepare_service(st):
+    if not IS_WIN:
+        apply(st, reload=False)
+    install_units(st)
+
+
+def service_action(action):
+    if not IS_WIN:
+        systemctl(action, UNIT, sudo=True)
+        return
+    if action == "stop" or action == "restart" and task_running():
+        task_call("end", capture=False)
+        if action == "restart":
+            for _ in range(25):
+                if not task_running():
+                    break
+                time.sleep(0.2)
+            else:
+                die("задача sbx не остановилась")
+    if action in {"start", "restart"}:
+        task_call("run", capture=False)
 
 
 # ─── команды ──────────────────────────────────────────────────────────────────
@@ -1100,7 +1453,7 @@ def cmd_ls(st, a):
     if not servers:
         print("серверов нет: sbx sub add ИМЯ URL")
         return
-    now = current_node(st) if is_active() else None
+    now = current_node(st) if is_active(st) else None
     live = now.split(" → ")[-1] if now else None
     sel = st["selected"]
     print(f"{'●' if sel == 'auto' else ' '}   0  auto" + (f"  → {live}" if sel == "auto" and live else ""))
@@ -1122,7 +1475,7 @@ def cmd_use(st, a):
     st["selected"] = tag
     save_state(st)
     apply(st, reload=False)
-    if is_active() and api_up(st):
+    if is_active(st) and api_up(st):
         api(st, "PUT", "/proxies/proxy", {"name": tag})
     print(f"✓ выбран {tag}")
 
@@ -1141,16 +1494,18 @@ class Prober:
     def ensure(self):
         if self.port:
             return
-        if is_active() and api_up(self.st):
+        if is_active(self.st) and api_up(self.st):
             self.port = self.st["settings"]["api_port"]
             return
         self.tmpdir = Path(tempfile.mkdtemp(prefix="sbx-test-"))
         port = free_port()
         cfg = build_config(self.st, all_servers(self.st), tun=False, api_port=port,
                            mixed_port=free_port())
-        (self.tmpdir / "c.json").write_text(json.dumps(cfg))
+        if IS_WIN:
+            cfg["log"]["output"] = str(self.tmpdir / "sing-box.log")
+        (self.tmpdir / "c.json").write_text(json.dumps(cfg), encoding="utf-8")
         self.proc = subprocess.Popen(
-            [SING_BOX, "run", "-c", str(self.tmpdir / "c.json"), "-D", str(self.tmpdir)],
+            [core_path(), "run", "-c", str(self.tmpdir / "c.json"), "-D", str(self.tmpdir)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(50):
             if api_up(self.st, port):
@@ -1231,21 +1586,42 @@ def fit(text, width):
     return out + " " * (width - w)
 
 
+def numbered_choice(options):
+    try:
+        answer = input("Номер (Enter — отмена): ").strip()
+    except EOFError:
+        return None
+    if not answer:
+        return None
+    if not answer.isdecimal() or int(answer) not in options:
+        die("нет такого номера")
+    return options[int(answer)]
+
+
 def cmd_pick(st, a):
     """Интерактивный выбор: ↑↓ листать, пробел — пинг, a — пинг всех, Enter — выбрать."""
-    import curses
+    try:
+        import curses
+    except ImportError:
+        curses = None
     import threading
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        die("нужен терминал; без него: sbx use НОМЕР|ИМЯ|auto")
     servers = all_servers(st)
     if not servers:
         die("серверов нет: sbx sub add ИМЯ URL")
+    if curses is None or not interactive() or not os.environ.get("TERM") and not IS_WIN:
+        options = {0: "auto", **{index: server["tag"] for index, server in enumerate(servers, 1)}}
+        for index, tag in options.items():
+            print(f"{index:>4}  {tag}")
+        choice = numbered_choice(options)
+        if choice is not None:
+            cmd_use(st, argparse.Namespace(server=choice))
+        return choice
     items = [{"tag": "auto", "kind": "urltest", "source": ""}] + [
         {"tag": s["tag"], "source": s["source"],
          "kind": s["outbound"]["type"] + ("+reality" if (s["outbound"].get("tls") or {}).get("reality") else "")}
         for s in servers]
     rx = st["settings"].get("auto_exclude")
-    running = is_active() and api_up(st)
+    running = is_active(st) and api_up(st)
     live = (current_node(st) or "").split(" → ")[-1] if running else None
     lat = dict(st["latency"])
     pending = set()
@@ -1364,6 +1740,7 @@ def cmd_pick(st, a):
         print("выбор не изменён")
         return
     cmd_use(st, argparse.Namespace(server=choice))
+    return choice
 
 
 def ip_snapshot():
@@ -1376,8 +1753,13 @@ def ip_snapshot():
 
 def cmd_probe(st, a):
     """Проверка ядра, TUN и подписки рядом с работающим VPN (Koala и т.п.), без перехвата."""
-    if is_active():
+    if is_active(st):
         die("sbx уже работает — проба не нужна, см. sbx status")
+    if IS_WIN:
+        print("Windows: проба проверяет ядро и серверы через временный mixed-прокси, без TUN.")
+        cmd_test(st, argparse.Namespace(filter=None if a.all or st["selected"] == "auto"
+                                        else st["selected"], timeout=5))
+        return
     servers = all_servers(st)
     if not servers:
         die("серверов нет: sbx sub add ИМЯ URL")
@@ -1466,36 +1848,45 @@ def free_port():
 
 
 def cmd_up(st, a):
+    if not require_windows_admin(["up", *(["--force"] if a.force else [])]):
+        return
     others = foreign_tun()
     if others and not a.force:
         die("работает другой VPN-клиент, маршруты подерутся:\n  " + "\n  ".join(others) +
             "\nзакройте его или запустите с --force")
-    apply(st, reload=False)
-    install_units(st)
-    systemctl("restart" if is_active() else "start", UNIT, sudo=True)
+    prepare_service(st)
+    service_action("restart" if (task_running() if IS_WIN else is_active(st)) else "start")
     time.sleep(1.5)
-    if not is_active():
-        run(["journalctl", "-u", UNIT, "-n", "30", "--no-pager"], check=False)
+    if IS_WIN:
+        for _ in range(20):
+            if is_active(st):
+                break
+            time.sleep(0.25)
+    if not is_active(st):
+        cmd_log(st, argparse.Namespace(lines=30, follow=False, replace=False))
         die("sing-box не запустился")
     print("✓ VPN включён")
     show_status(st)
 
 
 def cmd_down(st, a):
-    systemctl("stop", UNIT, sudo=True)
+    if not require_windows_admin(["down"]):
+        return
+    service_action("stop")
     print("✓ VPN выключен")
 
 
 def cmd_restart(st, a):
-    apply(st, reload=False)
-    install_units(st)
-    systemctl("restart", UNIT, sudo=True)
+    if not require_windows_admin():
+        return
+    prepare_service(st)
+    service_action("restart")
     print("✓ перезапущен")
 
 
 def show_status(st):
-    active = is_active()
-    enabled = unit_prop("UnitFileState")
+    active = is_active(st)
+    enabled = task_enabled("sbx") if IS_WIN else unit_prop("UnitFileState")
     s = st["settings"]
     print(f"состояние:   {'работает' if active else 'выключен'}"
           f"  (автозапуск: {'да' if enabled == 'enabled' else 'нет'})")
@@ -1516,7 +1907,7 @@ def show_status(st):
                   f"  · соединений {len(conns.get('connections') or [])}")
         except (urllib.error.URLError, OSError, ValueError):
             pass
-    t = unit_prop_of("sbx-update.timer", "UnitFileState")
+    t = task_enabled("sbx-update") if IS_WIN else unit_prop_of("sbx-update.timer", "UnitFileState")
     print(f"обновление:  {'по таймеру раз в 6 ч' if t == 'enabled' else 'вручную (sbx update)'}")
 
 
@@ -1542,20 +1933,57 @@ def cmd_ip(st, a):
 
 
 def cmd_log(st, a):
+    if IS_WIN:
+        service_log = protected_runtime() / "sing-box.log"
+        path = service_log if service_log.exists() else LOG_FILE
+        while a.follow and not path.exists():
+            time.sleep(0.5)
+            if service_log.exists():
+                path = service_log
+        if not path.exists():
+            print(f"журнала пока нет: {path}")
+            return
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in deque(stream, maxlen=max(0, a.lines)):
+                print(line, end="", flush=a.follow)
+            while a.follow:
+                if line := stream.readline():
+                    print(line, end="", flush=True)
+                else:
+                    time.sleep(0.5)
+        return
     cmd = ["journalctl", "-u", UNIT, "-n", str(a.lines), "--no-pager"] + (["-f"] if a.follow else [])
-    os.execvp(cmd[0], cmd)
+    if getattr(a, "replace", True):
+        os.execvp(cmd[0], cmd)
+    else:
+        run(cmd, check=False)
 
 
 def cmd_enable(st, a):
-    apply(st, reload=False)
-    install_units(st)
-    systemctl("enable", UNIT, "sbx-update.timer", sudo=True)
-    print("✓ автозапуск включён (sbx.service + sbx-update.timer)")
-    if a.now and not is_active():
+    if not require_windows_admin():
+        return
+    prepare_service(st)
+    if IS_WIN:
+        register_windows_service(True)
+        task_call("change", "sbx-update", "/enable", capture=False)
+        print("✓ автозапуск включён (задачи sbx и sbx-update)")
+    else:
+        systemctl("enable", UNIT, "sbx-update.timer", sudo=True)
+        print("✓ автозапуск включён (sbx.service + sbx-update.timer)")
+    if a.now and not is_active(st):
         cmd_up(st, argparse.Namespace(force=False))
 
 
 def cmd_disable(st, a):
+    if not require_windows_admin():
+        return
+    if IS_WIN:
+        if task_definition("sbx") is not None:
+            register_windows_service(False)
+        if a.timer and task_definition("sbx-update") is not None:
+            task_call("change", "sbx-update", "/disable", capture=False)
+        print("✓ автозапуск выключен (работающий VPN не тронут)")
+        return
     systemctl("disable", UNIT, sudo=True)
     if a.timer:
         systemctl("disable", "sbx-update.timer", sudo=True)
@@ -1638,8 +2066,11 @@ def commit_settings(st, changed):
         apply(st)
     save_state(st)
     if set(changed) & {"bypass_sports", "bypass_users", "before_units"}:
-        install_units(st)
-        if set(changed) & {"bypass_sports", "bypass_users"}:
+        if not IS_WIN:
+            install_units(st)
+        if IS_WIN:
+            warn("Windows: bypass_sports, bypass_users и before_units не применяются")
+        elif set(changed) & {"bypass_sports", "bypass_users"}:
             print("  правила обхода применятся при следующем sbx restart")
 
 
@@ -1690,7 +2121,7 @@ def via_label(st, to):
     if not to.startswith("re:"):
         return to
     label = f"лучший из /{to[3:]}/"
-    if is_active():
+    if is_active(st):
         try:
             now = api(st, "GET", "/proxies/" + urllib.parse.quote(VIA_PREFIX + to[3:], safe=""),
                       timeout=2).get("now")
@@ -1774,11 +2205,21 @@ def cmd_rule(st, a):
 
 
 def cmd_install(st, a):
-    apply(st, reload=False)
-    install_units(st)
+    if not require_windows_admin():
+        return
+    prepare_service(st)
 
 
 def cmd_uninstall(st, a):
+    if not require_windows_admin():
+        return
+    if IS_WIN:
+        task_call("end", check=False)
+        for name in ("sbx", "sbx-update"):
+            if task_definition(name) is not None:
+                task_call("delete", name, "/f", capture=False)
+        print(f"✓ задачи удалены; подписки и настройки остались в {CONF_DIR}")
+        return
     systemctl("disable", "--now", UNIT, "sbx-update.timer", sudo=True, check=False)
     for f in (UNIT, "sbx-update.service", "sbx-update.timer"):
         run(["sudo", "rm", "-f", str(UNIT_DIR / f)], check=False)
@@ -1789,7 +2230,7 @@ def cmd_uninstall(st, a):
 def cmd_config(st, a):
     apply(st, reload=False)
     if a.show:
-        print(CONFIG_FILE.read_text())
+        print(CONFIG_FILE.read_text(encoding="utf-8"))
     else:
         ok, err = check_config(CONFIG_FILE)
         print(f"{CONFIG_FILE}: {'ok' if ok else err}")
@@ -1801,6 +2242,10 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-V", "--version", action="version", version=f"sbx {__version__}")
     sp = p.add_subparsers(dest="cmd", metavar="команда")
+
+    x = sp.add_parser("core", help="установка ядра sing-box (Windows)")
+    x.add_argument("action", choices=["install"])
+    x.set_defaults(func=cmd_core)
 
     s = sp.add_parser("sub", help="подписки: ls | add ИМЯ URL | rm ИМЯ")
     ssp = s.add_subparsers(dest="action")
@@ -1888,8 +2333,8 @@ def main():
     x = sp.add_parser("config", help="проверить сгенерированный конфиг")
     x.add_argument("--show", action="store_true", help="напечатать (там ключи!)")
     x.set_defaults(func=cmd_config)
-    sp.add_parser("install", help="(пере)установить systemd-юниты").set_defaults(func=cmd_install)
-    sp.add_parser("uninstall", help="удалить юниты, данные оставить").set_defaults(func=cmd_uninstall)
+    sp.add_parser("install", help="(пере)установить службу или задачи").set_defaults(func=cmd_install)
+    sp.add_parser("uninstall", help="удалить службу или задачи, данные оставить").set_defaults(func=cmd_uninstall)
 
     a = p.parse_args()
     if not a.cmd:
@@ -1901,6 +2346,8 @@ def main():
         a.func(st, a)
     except subprocess.CalledProcessError as e:
         die(f"команда завершилась с ошибкой: {' '.join(map(str, e.cmd))}")
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as e:
+        die(str(e))
     except KeyboardInterrupt:
         sys.exit(130)
 
