@@ -37,9 +37,12 @@ def test_notice_throttle_and_quiet(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(sbx, 'latest_update', lambda: checks.append(now) or {'tag_name': 'v9.0.0'})
     args = argparse.Namespace(cmd='rule', quiet=False)
     now = 900_000
+    stale = sbx.load_state()
     sbx.maybe_notice_update(sbx.load_state(), args)
     assert 'Доступна новая версия sbx 9.0.0' in capsys.readouterr().out
     assert sbx.load_state()['last_update_check'] == now
+    sbx.maybe_notice_update(stale, args)
+    assert stale['last_update_check'] == now
     now += sbx.UPDATE_PERIOD - 1
     sbx.maybe_notice_update(sbx.load_state(), args)
     assert len(checks) == 1

@@ -44,14 +44,17 @@ def test_windows_paths_and_commands(monkeypatch, tmp_path):
 def test_task_xml_quotes_paths_and_separates_privileges(tmp_path):
     ns = {'t': sbx.TASK_NS}
     path = tmp_path / 'Program Files/sing-box.exe'
-    xml = sbx.task_xml([str(path), 'run', '-c', 'a b.json'], 'S-1-5-18', boot=False)
+    xml = sbx.task_xml([str(path), 'run', '-c', 'a b.json'], 'S-1-5-18', boot=False, reader_sid='S-1-5-21-1000')
     root = sbx.ET.fromstring(xml)
     assert root.findtext('.//t:Command', namespaces=ns) == str(path)
     assert root.findtext('.//t:Arguments', namespaces=ns) == 'run -c "a b.json"'
     assert root.findtext('.//t:BootTrigger/t:Enabled', namespaces=ns) == 'false'
     assert root.findtext('.//t:RunLevel', namespaces=ns) == 'HighestAvailable'
+    assert '(A;;GR;;;S-1-5-21-1000)' in root.findtext('.//t:SecurityDescriptor', namespaces=ns)
     root = sbx.ET.fromstring(sbx.task_xml(['sbx.exe', 'update', '-q'], 'S-1-5-21-1000'))
     assert root.findtext('.//t:Interval', namespaces=ns) == 'PT6H'
+    trigger = root.find('.//t:TimeTrigger', ns)
+    assert [item.tag.split('}')[-1] for item in trigger] == ['StartBoundary', 'Repetition']
     assert root.findtext('.//t:LogonType', namespaces=ns) == 'InteractiveToken'
     assert root.findtext('.//t:RunLevel', namespaces=ns) == 'LeastPrivilege'
 

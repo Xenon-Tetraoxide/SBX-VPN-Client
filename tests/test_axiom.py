@@ -155,6 +155,10 @@ def test_profile_parsing_and_picker(monkeypatch, capsys):
     assert '🇫🇷 France' in output and 'VLESS' in output and 'Reality (TCP)' in output and 'WebSocket' in output
     st = state()
     st['_axiom'] = {'root': None}
+    st['latency'] = {FRANCE: 55, NETHERLANDS: 22, GERMANY: 3}
+    cfg = sbx.build_config(st, servers)
+    assert cfg['outbounds'][1]['outbounds'][0] == NETHERLANDS
+    assert GERMANY not in cfg['outbounds'][1]['outbounds']
     monkeypatch.setattr(sbx, 'all_servers', lambda _: servers)
     monkeypatch.setattr(sbx, 'is_active', lambda _: False)
     sbx.cmd_ls(st, argparse.Namespace(filter=None))

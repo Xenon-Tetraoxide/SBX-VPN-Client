@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """sbx — консольный VPN-клиент поверх sing-box: подписки, выбор сервера, автозапуск.
 
-Движок — системный sing-box (пакет extra/sing-box), sbx только собирает для него
-конфиг и управляет systemd-юнитом. Из подписки берутся лишь сами серверы
+Движок — sing-box; sbx собирает конфиг и управляет systemd в Linux или задачей
+Планировщика в Windows. Из подписки берутся лишь сами серверы
 (outbound'ы): панели часто отдают конфиг в устаревшем формате полей, который
 свежий sing-box уже не принимает, поэтому DNS, TUN и маршрутизация свои.
 
@@ -64,7 +64,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 HOME = Path.home()
 IS_WIN = os.name == "nt"
@@ -190,7 +190,8 @@ def save_state(st):
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     if not IS_WIN:
         os.chmod(CONF_DIR, 0o700)
-    write_private(STATE_FILE, json.dumps({key: value for key, value in st.items() if key != "_axiom"},
+    write_private(STATE_FILE, json.dumps({key: value for key, value in st.items()
+                                        if key not in {"_axiom", "_reload_windows"}},
                                        ensure_ascii=False, indent=2))
 
 
@@ -335,11 +336,16 @@ def windows_admin():
 
 def request_windows_admin(argv):
     import ctypes
-    exe, *args = launch_command(argv)
+    args = ["--elevated-for", windows_user_sid()]
+    if axiom_mode():
+        args.append("--axiom")
+    exe, *args = launch_command([*args, *argv])
     execute = ctypes.windll.shell32.ShellExecuteW
     execute.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
                         ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
     execute.restype = ctypes.c_void_p
+    if frozen_windows():
+        os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     result = execute(None, "runas", exe, subprocess.list2cmdline(args), str(Path.cwd()), 1)
     if not result or result <= 32:
         die("не удалось получить права администратора (UAC)")
@@ -466,17 +472,38 @@ def maybe_notice_update(st, a):
     if (not interactive() or getattr(a, "quiet", False) or a.cmd == "self-update"
             or os.environ.get("SBX_NO_UPDATE_CHECK") == "1" or os.environ.get("INVOCATION_ID")):
         return
-    now = int(time.time())
-    if now - st.get("last_update_check", 0) < UPDATE_PERIOD:
-        return
-    st["last_update_check"] = now
     try:
-        save_state(st)
+        if not take_update_slot(st):
+            return
         release = latest_update()
         if release and update_prompt(release):
             install_update(release)
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as e:
         warn(f"не удалось проверить или установить обновление: {e}")
+
+
+def take_update_slot(st):
+    now = int(time.time())
+    if now - st.get("last_update_check", 0) < UPDATE_PERIOD:
+        return False
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    with (CONF_DIR / ".update-check.lock").open("a+b") as lock:
+        try:
+            if IS_WIN:
+                import msvcrt
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fresh = load_state() if STATE_FILE.exists() else st
+        if now - fresh.get("last_update_check", 0) < UPDATE_PERIOD:
+            st["last_update_check"] = fresh["last_update_check"]
+            return False
+        st["last_update_check"] = fresh["last_update_check"] = now
+        save_state(fresh)
+        return True
 
 
 def human_bytes(n):
@@ -804,7 +831,9 @@ def is_stub(o):
 # ─── подписки ─────────────────────────────────────────────────────────────────
 
 def sub_file(name):
-    if not name or name in {".", ".."} or re.search(r'[<>:"/\\|?*\x00-\x1f]', name):
+    invalid = r'[<>:"/\\|?*\x00-\x1f]' if IS_WIN else r'[/\x00]'
+    reserved = IS_WIN and re.fullmatch(r"CON|PRN|AUX|NUL|(?:COM|LPT)[1-9¹²³]", name.split(".", 1)[0], re.I)
+    if not name or name in {".", ".."} or reserved or re.search(invalid, name):
         raise ValueError("имя подписки не должно содержать разделители пути: " + name)
     return SUBS_DIR / f"{name}.json"
 
@@ -1021,10 +1050,11 @@ def profile_group(text):
     if not isinstance(document, dict) or not isinstance(document.get("outbounds"), list):
         return None
     outbounds = [entry for entry in document["outbounds"] if isinstance(entry, dict)]
-    tags = {entry["tag"] for entry in outbounds if entry.get("type") in PROXY_TYPES
+    group_types = {"selector", "urltest"}
+    tags = {entry["tag"] for entry in outbounds if entry.get("type") not in group_types
             and isinstance(entry.get("tag"), str)}
     groups = [[tag for tag in entry["outbounds"] if isinstance(tag, str) and tag in tags]
-              for entry in outbounds if entry.get("type") in {"selector", "urltest"}
+              for entry in outbounds if entry.get("type") in group_types
               and isinstance(entry.get("outbounds"), list)]
     group = max(groups, key=len, default=None)
     return {tag: index for index, tag in enumerate(group)} if group else None
@@ -1447,6 +1477,12 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
     options = axiom_options(servers) if st.get("_axiom") else []
     eligible = list(dict.fromkeys(tag for _, tag in options)) or tags
     auto = [tag for tag in eligible if not (rx and re.search(rx, tag, re.I))] or eligible
+    if options:
+        available = set(auto)
+        best = axiom_fastest([(key, tag) for key, tag in options if tag in available], st["latency"])
+        if best:
+            auto.remove(best)
+            auto.insert(0, best)
     selected = selected_server(st, servers)
     selected = selected if selected in tags else "auto"
 
@@ -1595,7 +1631,10 @@ def apply(st, reload=True, quiet=False):
                 publish_windows_config(st)
                 service_action("restart")
             elif not quiet:
-                warn("конфиг сохранён; примените к задаче SYSTEM через sbx restart (UAC)")
+                if interactive():
+                    st["_reload_windows"] = True
+                else:
+                    warn("конфиг сохранён; примените к задаче SYSTEM через sbx restart (UAC)")
         else:
             pid = int(unit_prop("MainPID") or 0)
             if pid:
@@ -1803,19 +1842,24 @@ def task_enabled(name):
     return "enabled" if enabled == "true" else "disabled"
 
 
-def task_xml(command, sid, *, boot=None, work=None):
+def task_xml(command, sid, *, boot=None, work=None, reader_sid=None):
     root = ET.Element("Task", xmlns=TASK_NS, version="1.2")
 
     def element(parent, name, value):
         ET.SubElement(parent, name).text = value
 
+    if reader_sid is not None:
+        if not re.fullmatch(r"S-1(?:-[0-9]+)+", reader_sid):
+            raise ValueError("недопустимый SID пользователя Windows")
+        registration = ET.SubElement(root, "RegistrationInfo")
+        element(registration, "SecurityDescriptor", f"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;{reader_sid})")
     triggers = ET.SubElement(root, "Triggers")
     if boot is not None:
         element(ET.SubElement(triggers, "BootTrigger"), "Enabled", str(boot).lower())
     else:
         trigger = ET.SubElement(triggers, "TimeTrigger")
-        element(ET.SubElement(trigger, "Repetition"), "Interval", "PT6H")
         element(trigger, "StartBoundary", time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 180)))
+        element(ET.SubElement(trigger, "Repetition"), "Interval", "PT6H")
     principal = ET.SubElement(ET.SubElement(root, "Principals"), "Principal", id="Author")
     element(principal, "UserId", sid)
     if boot is None:
@@ -1833,11 +1877,12 @@ def task_xml(command, sid, *, boot=None, work=None):
     return ET.tostring(root, encoding="utf-16", xml_declaration=True)
 
 
-def register_task(name, xml):
+def register_task(name, xml, *, system=False):
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "task.xml"
         path.write_bytes(xml)
-        task_call("create", name, "/xml", str(path), "/f", capture=False)
+        user = ["/ru", "SYSTEM"] if system else []
+        task_call("create", name, "/xml", str(path), *user, "/f", capture=False)
 
 
 def protected_runtime():
@@ -1893,7 +1938,8 @@ def register_windows_service(boot):
     runtime = protected_runtime()
     command = [str(runtime / "sing-box.exe"), "run", "-c", str(runtime / "config.json"),
                "-D", str(runtime)]
-    register_task("sbx", task_xml(command, "S-1-5-18", boot=boot, work=runtime))
+    xml = task_xml(command, "S-1-5-18", boot=boot, work=runtime, reader_sid=windows_user_sid())
+    register_task("sbx", xml, system=True)
 
 
 def install_windows_tasks(st, quiet=False):
@@ -1935,10 +1981,13 @@ def register_windows_updater():
 
 
 def prepare_service(st):
-    if not IS_WIN:
-        apply(st, reload=False)
     if not all_servers(st):
         die("серверов нет: добавьте подписку (sbx sub add) или сервер (sbx add)")
+    if st.get("_axiom") and effective_route(st) == "ru" and any(
+            not (RULESET_DIR / f"{tag}.srs").exists() for tag in RULESETS):
+        update_rulesets(st)
+    if not IS_WIN:
+        apply(st, reload=False)
     install_units(st)
 
 
@@ -3065,6 +3114,10 @@ def update_arguments(parser, *, self_update=False):
 def main(argv=None):
     remove_old_exe()
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--elevated-for"]:
+        if not IS_WIN or len(argv) < 3 or not windows_admin() or windows_user_sid() != argv[1]:
+            die("UAC требует повышение прав той же учётной записи Windows")
+        del argv[:2]
     if argv[:1] == ["--axiom"]:
         os.environ["SBX_BRAND"] = "axiom"
         argv.pop(0)
@@ -3193,6 +3246,9 @@ def main(argv=None):
         if a.cmd != "core":
             maybe_notice_update(st, a)
         a.func(st, a)
+        if st.get("_reload_windows"):
+            print("Для применения нового конфига надо перезапустить задачу sbx (UAC).", flush=True)
+            request_windows_admin(["restart"])
     except subprocess.CalledProcessError as e:
         die(f"команда завершилась с ошибкой: {' '.join(map(str, e.cmd))}")
     except (OSError, ValueError, KeyError, ImportError, sqlite3.Error, zipfile.BadZipFile, ET.ParseError) as e:
