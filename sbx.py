@@ -27,6 +27,8 @@
   sbx enable | disable                           # автозапуск при загрузке
   sbx mode tun|proxy    sbx route ru|global
   sbx rule proxy example.ru | direct example.com | rm example.ru   # свои домены
+  sbx rule via 're:Germany' geosite:google     # раздельная маршрутизация: список через свой сервер
+  sbx rule proxy geosite:google-gemini         # …а это исключение — через основной
   sbx set exclude --add 203.0.113.7 | --rm 203.0.113.7             # элемент списка
   sbx add 'vless://…'                            # одиночный сервер без подписки
   sbx probe [-a]                                 # проверка рядом с другим VPN, без перехвата
@@ -53,7 +55,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 HOME = Path.home()
 CONF_DIR = HOME / ".config/sbx"
@@ -108,6 +110,7 @@ DEFAULT_STATE = {
         "bypass_users": [],         # весь трафик этих пользователей — мимо TUN (например, playit)
         "proxy_domains": [],        # домены (с поддоменами) — всегда через VPN, даже при route ru
         "direct_domains": [],       # домены (с поддоменами) — всегда напрямую
+        "via_rules": [],            # [{to, items}] — домены/geosite через конкретный сервер или группу
         "dns_remote": "https://1.1.1.1/dns-query",
         "dns_direct": "77.88.8.8",
         "auto_exclude": "",         # regex: какие серверы не брать в auto
@@ -581,13 +584,49 @@ def update_subs(st, names=None, quiet=False):
             print(f"✓ {sub['name']}: {len(servers)} серверов ({meta['format']}{extra})")
             for e in errors:
                 print(f"    пропущен {e}")
-    update_rulesets(quiet)
+    update_rulesets(st, quiet)
     return ok
 
 
-def update_rulesets(quiet=False, force=False):
+GEO_URL = {
+    "geosite": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-{}.srs",
+    "geoip": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-{}.srs",
+}
+GEO_RE = re.compile(r"^(geosite|geoip):([a-z0-9][a-z0-9!@._-]*)$")
+
+
+def geo_tag(item):
+    """«geosite:google» → «geosite-google»; обычный домен → None."""
+    m = GEO_RE.match(item)
+    return f"{m[1]}-{m[2]}" if m else None
+
+
+def rule_items(st):
+    """Все элементы правил: свои списки доменов и via_rules."""
+    s = st["settings"]
+    out = [x for k in DOMAIN_KEYS for x in s.get(k, [])]
+    for v in s.get("via_rules", []):
+        out += v["items"]
+    return out
+
+
+def wanted_rulesets(st):
+    """tag -> url: rule-set'ы route ru и те, что упомянуты в правилах."""
+    want = dict(RULESETS)
+    for item in rule_items(st):
+        m = GEO_RE.match(item)
+        if m:
+            want[f"{m[1]}-{m[2]}"] = GEO_URL[m[1]].format(m[2])
+    return want
+
+
+def update_rulesets(st, quiet=False, force=False, only=None):
+    """Скачать устаревшие (старше 7 дней) rule-set'ы. -> список тегов, которые не скачались."""
     RULESET_DIR.mkdir(parents=True, exist_ok=True)
-    for tag, url in RULESETS.items():
+    failed = []
+    for tag, url in wanted_rulesets(st).items():
+        if only is not None and tag not in only:
+            continue
         path = RULESET_DIR / f"{tag}.srs"
         if path.exists() and not force and time.time() - path.stat().st_mtime < 7 * 86400:
             continue
@@ -598,7 +637,9 @@ def update_rulesets(quiet=False, force=False):
             if not quiet:
                 print(f"✓ rule-set {tag} ({human_bytes(len(data))})")
         except (urllib.error.URLError, OSError) as e:
+            failed.append(tag)
             warn(f"rule-set {tag} не скачался: {e}")
+    return failed
 
 
 # ─── серверы и конфиг ─────────────────────────────────────────────────────────
@@ -609,7 +650,7 @@ def all_servers(st):
 
     def add(name, o, source):
         tag = name.strip() or "server"
-        if tag in seen or tag in ("proxy", "auto", "direct"):
+        if tag in seen or tag in ("proxy", "auto", "direct") or tag.startswith(VIA_PREFIX):
             base, n = f"{tag} [{source}]", 2
             tag = base
             while tag in seen:
@@ -623,6 +664,36 @@ def all_servers(st):
     for s in st["manual"]:
         add(s["name"], s["outbound"], "manual")
     return out
+
+
+VIA_PREFIX = "via: "   # теги групп для via_rules вида re:… (имя сервера так начинаться не может)
+
+
+def via_target(st, to, tags):
+    """Цель правила via -> (тег outbound'а, urltest-группа или None).
+
+    to: тег сервера, «re:REGEX» (urltest из подходящих серверов), auto, proxy или direct.
+    Цели больше нет (подписка обновилась) — правило уходит в proxy, конфиг не ломается.
+    """
+    if to in ("proxy", "auto", "direct"):
+        return to, None
+    if to.startswith("re:"):
+        rx = st["settings"].get("auto_exclude")
+        try:
+            found = [t for t in tags if re.search(to[3:], t, re.I)]
+        except re.error:
+            found = []
+        members = [t for t in found if not (rx and re.search(rx, t, re.I))] or found
+        if not members:
+            warn(f"правило via {to}: подходящих серверов нет — идёт через proxy")
+            return "proxy", None
+        tag = VIA_PREFIX + to[3:]
+        return tag, {"type": "urltest", "tag": tag, "outbounds": members,
+                     "url": st["settings"]["test_url"], "interval": "5m", "tolerance": 50}
+    if to in tags:
+        return to, None
+    warn(f"правило via: сервера «{to}» больше нет — идёт через proxy")
+    return "proxy", None
 
 
 def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe=False):
@@ -656,24 +727,53 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
         {"ip_cidr": [cfg_s["dns_direct"] + "/32"], "outbound": "direct"},
         {"ip_is_private": True, "outbound": "direct"},
     ]
-    def domains(key):
-        return sorted({d for d in map(norm_domain, cfg_s.get(key, [])) if d})
-    proxy_d, direct_d = domains("proxy_domains"), domains("direct_domains")
-    # свои домены — раньше правил route ru: .ru из proxy_domains всё равно уходит в VPN
-    if direct_d:
-        dns["rules"].append({"domain_suffix": direct_d, "server": "dns-direct"})
-        rules.append({"domain_suffix": direct_d, "outbound": "direct"})
-    if proxy_d:
-        dns["rules"].append({"domain_suffix": proxy_d, "server": "dns-remote"})
-        rules.append({"domain_suffix": proxy_d, "outbound": "proxy"})
-    rule_sets = []
+    # Свои правила — раньше route ru: «.ru» из proxy_domains всё равно уходит в VPN, а google.ru
+    # из via-правила — на свой сервер. Порядок: direct, proxy, via (первое совпадение побеждает),
+    # поэтому исключение из большого списка — это тот же элемент в proxy/direct.
+    used_sets, extra_out, extra_dns = [], [], []
+
+    def add_rules(items, outbound, dns_server):
+        sfx = sorted({norm_domain(d) for d in items if not geo_tag(d)} - {""})
+        sets = []
+        for t in dict.fromkeys(filter(None, map(geo_tag, items))):
+            if (RULESET_DIR / f"{t}.srs").exists():
+                sets.append(t)
+            else:
+                warn(f"rule-set {t} не скачан — правило пропущено (sbx update)")
+        if sfx:
+            dns["rules"].append({"domain_suffix": sfx, "server": dns_server})
+            rules.append({"domain_suffix": sfx, "outbound": outbound})
+        if sets:
+            if site := [t for t in sets if t.startswith("geosite-")]:
+                dns["rules"].append({"rule_set": site, "server": dns_server})
+            rules.append({"rule_set": sets, "outbound": outbound})
+            used_sets.extend(sets)
+
+    add_rules(cfg_s.get("direct_domains", []), "direct", "dns-direct")
+    add_rules(cfg_s.get("proxy_domains", []), "proxy", "dns-remote")
+    for v in cfg_s.get("via_rules", []):
+        out, group = via_target(st, v["to"], tags)
+        if group and all(o["tag"] != out for o in extra_out):
+            extra_out.append(group)
+        if out == "direct":
+            dns_server = "dns-direct"
+        elif out in ("proxy", "auto"):
+            dns_server = "dns-remote"
+        else:
+            # DNS через тот же сервер: иначе CDN отдаст адреса, ближайшие к основному выходу
+            dns_server = f"dns-via-{len(extra_dns) + 1}"
+            extra_dns.append({**dns["servers"][0], "tag": dns_server, "detour": out})
+        add_rules(v["items"], out, dns_server)
+    dns["servers"] += extra_dns
+
     if ru:
-        rule_sets = [{"type": "local", "tag": t, "format": "binary", "path": str(p)}
-                     for t, p in have.items()]
         if "geosite-category-ru" in have:
             dns["rules"].append({"rule_set": ["geosite-category-ru"], "server": "dns-direct"})
         rules.append({"domain_suffix": [".ru", ".su", ".xn--p1ai", ".рф"], "outbound": "direct"})
         rules.append({"rule_set": list(have), "outbound": "direct"})
+        used_sets.extend(have)
+    rule_sets = [{"type": "local", "tag": t, "format": "binary", "path": str(RULESET_DIR / f"{t}.srs")}
+                 for t in dict.fromkeys(used_sets)]
 
     inbounds = []
     if probe:
@@ -696,6 +796,7 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
          "interrupt_exist_connections": True},
         {"type": "urltest", "tag": "auto", "outbounds": auto, "url": cfg_s["test_url"],
          "interval": "5m", "tolerance": 50},
+        *extra_out,
         *({**s["outbound"], "tag": s["tag"]} for s in servers),
         {"type": "direct", "tag": "direct"},
     ]
@@ -1405,6 +1506,9 @@ def show_status(st):
         node = current_node(st)
         if node:
             print(f"сейчас:      {node}")
+    for v in s.get("via_rules", []):
+        print(f"раздельно:   {', '.join(v['items'])} → {via_label(st, v['to'])}")
+    if active:
         try:
             conns = api(st, "GET", "/connections")
             print(f"трафик:      ↑ {human_bytes(conns.get('uploadTotal', 0))}"
@@ -1471,7 +1575,7 @@ def cmd_route(st, a):
         st["settings"]["route"] = a.route
         save_state(st)
         if a.route == "ru":
-            update_rulesets()
+            update_rulesets(st)
         apply(st)
     print(st["settings"]["route"])
 
@@ -1496,6 +1600,11 @@ def norm_item(key, v):
             die(f"exclude — только IP или подсеть, а не «{v}». "
                 f"Домен мимо VPN: sbx rule direct {norm_domain(v) or v}")
     if key in DOMAIN_KEYS:
+        g = v.lower()
+        if g.split(":", 1)[0] in GEO_URL:
+            if not GEO_RE.match(g):
+                die(f"не rule-set: «{v}» (пример: geosite:google, geoip:telegram)")
+            return g
         d = norm_domain(v)
         try:
             ipaddress.ip_network(d, strict=False)
@@ -1522,6 +1631,9 @@ def split_items(key, values):
 
 def commit_settings(st, changed):
     """Проверить конфиг и только потом сохранить: отвергнутое sing-box в state.json не попадает."""
+    new = [t for t in map(geo_tag, rule_items(st)) if t and not (RULESET_DIR / f"{t}.srs").exists()]
+    if new and (failed := update_rulesets(st, only=set(new))):
+        die(f"нет такого списка или он не скачался: {', '.join(failed)} — ничего не изменено")
     if all_servers(st):
         apply(st)
     save_state(st)
@@ -1540,6 +1652,8 @@ def cmd_set(st, a):
         return
     if a.key not in s:
         die(f"нет настройки {a.key}")
+    if a.key == "via_rules" and (a.add or a.rm or a.value is not None):
+        die("via_rules меняется через sbx rule via ЦЕЛЬ ДОМЕН… / sbx rule rm ДОМЕН…")
     cur = s[a.key]
     if a.add or a.rm:
         if not isinstance(cur, list):
@@ -1571,37 +1685,91 @@ def cmd_set(st, a):
     print(f"{a.key} = {json.dumps(val, ensure_ascii=False)}")
 
 
+def via_label(st, to):
+    """Как показать цель via-правила; для группы — и сервер, выбранный в ней сейчас."""
+    if not to.startswith("re:"):
+        return to
+    label = f"лучший из /{to[3:]}/"
+    if is_active():
+        try:
+            now = api(st, "GET", "/proxies/" + urllib.parse.quote(VIA_PREFIX + to[3:], safe=""),
+                      timeout=2).get("now")
+            if now:
+                label += f" → {now}"
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+    return label
+
+
+def parse_via_target(st, q):
+    """Цель из командной строки: номер/часть имени сервера, auto, proxy, direct или re:REGEX."""
+    if q in ("proxy", "direct"):
+        return q
+    if q.startswith("re:"):
+        try:
+            re.compile(q[3:])
+        except re.error as e:
+            die(f"плохое регулярное выражение {q[3:]!r}: {e}")
+        if not any(re.search(q[3:], s["tag"], re.I) for s in all_servers(st)):
+            die(f"под /{q[3:]}/ не подходит ни один сервер (sbx ls)")
+        return q
+    return resolve(st, q)
+
+
+def drop_items(s, items):
+    """Убрать элементы из всех списков правил; пустые via-правила исчезают."""
+    for key in DOMAIN_KEYS:
+        s[key] = [d for d in s.get(key, []) if d not in items]
+    s["via_rules"] = [{**v, "items": [d for d in v["items"] if d not in items]}
+                      for v in s.get("via_rules", [])]
+    s["via_rules"] = [v for v in s["via_rules"] if v["items"]]
+
+
 def cmd_rule(st, a):
     s = st["settings"]
     if a.action in (None, "ls"):
         if a.domains:
             die("sbx rule ls — без аргументов")
-        for key, title in (("proxy_domains", "через VPN"), ("direct_domains", "напрямую")):
+        for key, title in (("direct_domains", "напрямую"), ("proxy_domains", "через VPN (proxy)")):
             items = s.get(key, [])
-            print(f"{title} ({key}): {', '.join(items) if items else '—'}")
+            print(f"{title}: {', '.join(items) if items else '—'}")
+        for v in s.get("via_rules", []):
+            print(f"через {via_label(st, v['to'])}: {', '.join(v['items'])}")
         print(f"остальное: route {s['route']}"
               + (" (российское напрямую, прочее через VPN)" if s["route"] == "ru" else " (всё через VPN)"))
+        print("порядок: напрямую → proxy → via → route; первое совпадение побеждает")
         return
+    to = None
+    if a.action == "via":
+        if not a.domains:
+            die("sbx rule via ЦЕЛЬ ДОМЕН|geosite:ИМЯ…")
+        to = parse_via_target(st, a.domains.pop(0))
     if not a.domains:
-        die(f"sbx rule {a.action} ДОМЕН…")
+        die(f"sbx rule {a.action} {'ЦЕЛЬ ' if to else ''}ДОМЕН…")
     doms = split_items("proxy_domains", a.domains)
     if a.action == "rm":
-        known = {d for k in DOMAIN_KEYS for d in s.get(k, [])}
+        known = set(rule_items(st))
         for d in doms:
             if d not in known:
                 warn(f"{d}: такого правила нет")
         doms = [d for d in doms if d in known]
         if not doms:
             return
-        for key in DOMAIN_KEYS:
-            s[key] = [d for d in s.get(key, []) if d not in doms]
+        drop_items(s, doms)
     else:
-        key = "proxy_domains" if a.action == "proxy" else "direct_domains"
-        other = DOMAIN_KEYS[1] if key == DOMAIN_KEYS[0] else DOMAIN_KEYS[0]
-        s[other] = [d for d in s.get(other, []) if d not in doms]
-        s[key] = list(dict.fromkeys([*s.get(key, []), *doms]))
-    commit_settings(st, list(DOMAIN_KEYS))
-    where = {"proxy": "через VPN", "direct": "напрямую", "rm": "по общим правилам"}[a.action]
+        drop_items(s, doms)
+        if to is None:
+            key = "proxy_domains" if a.action == "proxy" else "direct_domains"
+            s[key] = [*s.get(key, []), *doms]
+        else:
+            same = [v for v in s["via_rules"] if v["to"] == to]
+            if same:
+                same[0]["items"] += doms
+            else:
+                s["via_rules"].append({"to": to, "items": doms})
+    commit_settings(st, [*DOMAIN_KEYS, "via_rules"])
+    where = {"proxy": "через VPN (proxy)", "direct": "напрямую", "rm": "по общим правилам"}.get(
+        a.action) or f"через {via_label(st, to)}"
     print(f"✓ {', '.join(doms)} — {where}")
 
 
@@ -1705,8 +1873,9 @@ def main():
     x = sp.add_parser("route", help="ru — российское напрямую, global — всё через VPN")
     x.add_argument("route", nargs="?", choices=["ru", "global"])
     x.set_defaults(func=cmd_route)
-    x = sp.add_parser("rule", help="свои домены: ls | proxy ДОМЕН… | direct ДОМЕН… | rm ДОМЕН…")
-    x.add_argument("action", nargs="?", choices=["ls", "proxy", "direct", "rm"])
+    x = sp.add_parser("rule", help="свои правила: ls | proxy ДОМЕН… | direct ДОМЕН… "
+                                   "| via ЦЕЛЬ ДОМЕН… | rm ДОМЕН…; вместо домена — geosite:ИМЯ, geoip:ИМЯ")
+    x.add_argument("action", nargs="?", choices=["ls", "proxy", "direct", "via", "rm"])
     x.add_argument("domains", nargs="*", metavar="домен")
     x.set_defaults(func=cmd_rule)
     x = sp.add_parser("set", help="настройки: sbx set [ключ [значение | --add X | --rm X]]")
