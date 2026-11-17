@@ -46,6 +46,7 @@ import secrets
 import shutil
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -54,10 +55,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 __version__ = "1.2.0"
@@ -186,7 +190,8 @@ def save_state(st):
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     if not IS_WIN:
         os.chmod(CONF_DIR, 0o700)
-    write_private(STATE_FILE, json.dumps(st, ensure_ascii=False, indent=2))
+    write_private(STATE_FILE, json.dumps({key: value for key, value in st.items() if key != "_axiom"},
+                                       ensure_ascii=False, indent=2))
 
 
 def hwid():
@@ -746,7 +751,7 @@ def clean_outbound(o):
     return o
 
 
-def parse_subscription(text):
+def parse_subscription(text, *, preserve_detour=False):
     """-> (список (имя, outbound), список ошибок, формат)"""
     items, errors = [], []
     s = text.strip()
@@ -754,9 +759,14 @@ def parse_subscription(text):
         try:
             j = json.loads(s)
             obs = j.get("outbounds", []) if isinstance(j, dict) else j
+            if not isinstance(obs, list):
+                return items, ["outbounds не является списком"], "sing-box json"
             for o in obs:
-                if o.get("type") in PROXY_TYPES:
-                    items.append((o.get("tag"), clean_outbound(o)))
+                if isinstance(o, dict) and o.get("type") in PROXY_TYPES:
+                    outbound = clean_outbound(o)
+                    if preserve_detour and isinstance(o.get("detour"), str) and o["detour"]:
+                        outbound["detour"] = o["detour"]
+                    items.append((o.get("tag"), outbound))
             return items, errors, "sing-box json"
         except json.JSONDecodeError:
             pass
@@ -794,6 +804,8 @@ def is_stub(o):
 # ─── подписки ─────────────────────────────────────────────────────────────────
 
 def sub_file(name):
+    if not name or name in {".", ".."} or re.search(r'[<>:"/\\|?*\x00-\x1f]', name):
+        raise ValueError("имя подписки не должно содержать разделители пути: " + name)
     return SUBS_DIR / f"{name}.json"
 
 
@@ -803,6 +815,10 @@ def load_sub_cache(name):
 
 
 def fetch_sub(st, sub):
+    if sub.get("local_path"):
+        body = Path(sub["local_path"]).read_text(encoding="utf-8-sig")
+        servers, errors, stubs, fmt = subscription_servers(body)
+        return servers, errors, stubs, {"updated": int(time.time()), "format": fmt, "title": ""}
     headers = {"User-Agent": sub.get("ua") or st["settings"]["ua"], "Accept": "*/*"}
     if sub.get("hwid", True):
         headers.update({"x-hwid": hwid(), "x-device-os": "Windows" if IS_WIN else "Linux",
@@ -819,26 +835,35 @@ def fetch_sub(st, sub):
         k, _, v = part.strip().partition("=")
         if k and v.strip().isdigit():
             meta[k] = int(v)
-    items, errors, fmt = parse_subscription(body)
+    servers, errors, stubs, fmt = subscription_servers(body)
+    meta["format"] = fmt
+    return servers, errors, stubs, meta
+
+
+def subscription_servers(body, *, app=False):
+    items, errors, fmt = parse_subscription(body, preserve_detour=app)
     servers, stubs = [], 0
     for name, o in items:
         if is_stub(o):
             stubs += 1
             continue
-        servers.append({"name": name or f"{o['type']} {o.get('server')}", "outbound": o})
-    meta["format"] = fmt
-    return servers, errors, stubs, meta
+        servers.append({"name": name if isinstance(name, str) and name else f"{o['type']} {o.get('server')}",
+                        "outbound": o})
+    return servers, errors, stubs, fmt
 
 
 def update_subs(st, names=None, quiet=False):
     subs = [s for s in st["subs"] if not names or s["name"] in names]
-    if names and not subs:
-        die(f"нет подписки {', '.join(names)}")
-    ok = True
+    app = st.get("_axiom")
+    profiles = [row for row in app["profiles"] if not names or app_sub_name(row) in names] if app else []
+    missing = set(names or ()) - {sub["name"] for sub in subs} - {app_sub_name(row) for row in profiles}
+    if missing:
+        die(f"нет подписки {', '.join(sorted(missing))}")
+    ok = update_app_profiles(app, profiles, quiet) if profiles else True
     for sub in subs:
         try:
             servers, errors, stubs, meta = fetch_sub(st, sub)
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, OSError, ValueError, ImportError, TypeError) as e:
             warn(f"{sub['name']}: не скачалась ({e}), остаётся прошлый список")
             ok = False
             continue
@@ -857,6 +882,341 @@ def update_subs(st, names=None, quiet=False):
                 print(f"    пропущен {e}")
     update_rulesets(st, quiet)
     return ok
+
+
+# ─── данные AxiOm ──────────────────────────────────────────────────────────────
+
+AXIOM_UA_VERSION = "4.6.1"
+AXIOM_DB_VERSION = 5
+AXIOM_HEADERS = {"profile-title", "content-disposition", "subscription-userinfo", "profile-update-interval",
+                 "support-url", "profile-web-page-url", "enable-warp", "enable-fragment"}
+AXIOM_PREFS = ("server_selector_country", "server_selector_protocol", "server_selector_transport")
+AXIOM_AUTO = "__auto__"
+AXIOM_FILE = "shared_preferences.json"
+
+
+def axiom_mode(argv0=None):
+    return os.environ.get("SBX_BRAND", "").lower() == "axiom" or axiom_mode_without_env(
+        sys.argv[0] if argv0 is None else argv0)
+
+
+def axiom_mode_without_env(argv0):
+    return re.split(r"[/\\]", str(argv0))[-1].lower() in {"axiom", "axiom.exe", "axiom.py"}
+
+
+def axiom_locations():
+    portable = []
+    if IS_WIN:
+        roaming = Path(os.environ.get("APPDATA") or HOME / "AppData/Roaming")
+        installed = [roaming / "AxiOm/AxiOm", roaming / "AxiOm"]
+        exe = Path(sys.executable if frozen_windows() else sys.argv[0]).absolute().parent
+        portable = [exe / "hiddify_portable_data", exe.parent / "hiddify_portable_data"]
+    else:
+        share = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
+        installed = [share / "app.hiddify.com", share / "hiddify"]
+    if override := os.environ.get("SBX_AXIOM_HOME"):
+        root = Path(override).expanduser().absolute()
+        if not (root / "db.sqlite").is_file():
+            raise ValueError(f"в SBX_AXIOM_HOME нет db.sqlite: {root}; сначала запустите приложение AxiOm")
+    else:
+        root = next((path for path in [*portable, *installed] if (path / "db.sqlite").is_file()), None)
+    if root is None:
+        return None
+    prefs = root / AXIOM_FILE
+    is_portable = root.name == "hiddify_portable_data"
+    if is_portable and not prefs.exists() and IS_WIN:
+        prefs = next((path / AXIOM_FILE for path in installed if (path / AXIOM_FILE).is_file()),
+                     installed[0] / AXIOM_FILE)
+    return {"root": root, "prefs_path": prefs, "prefix": "portable." if is_portable else "flutter."}
+
+
+def read_axiom_prefs(path):
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}
+    prefs = json.loads(text)
+    if not isinstance(prefs, dict):
+        raise ValueError("настройки AxiOm не являются JSON-объектом")
+    return prefs
+
+
+def axiom_db(app, mode):
+    uri = (app["root"] / "db.sqlite").absolute().as_uri()
+    db = sqlite3.connect(f"{uri}?mode={mode}", uri=True, timeout=0.25)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def load_axiom_context():
+    app = axiom_locations()
+    if app is None:
+        return {"root": None, "profiles": [], "prefs": {}, "prefix": "flutter.", "version": None}
+    reload_axiom_profiles(app)
+    try:
+        app["prefs"] = read_axiom_prefs(app["prefs_path"])
+    except (OSError, ValueError) as exc:
+        warn(f"настройки AxiOm не прочитаны ({exc}); файл не будет перезаписан")
+        app["prefs"] = {}
+    return app
+
+
+def reload_axiom_profiles(app):
+    with closing(axiom_db(app, "ro")) as db, db:
+        db.execute("BEGIN")
+        app["version"] = db.execute("PRAGMA user_version").fetchone()[0]
+        try:
+            app["profiles"] = [dict(row) for row in db.execute("SELECT * FROM profile_entries ORDER BY active DESC, name, id")]
+        except sqlite3.OperationalError:
+            if app["version"] == AXIOM_DB_VERSION:
+                raise
+            app["profiles"] = []
+    if app["version"] != AXIOM_DB_VERSION:
+        warn(f"база AxiOm версии {app['version']} — только чтение; для записи нужна версия {AXIOM_DB_VERSION}")
+
+
+def app_writable(app):
+    if app["version"] != AXIOM_DB_VERSION:
+        raise ValueError(f"база AxiOm версии {app['version']} открыта только для чтения; нужна версия {AXIOM_DB_VERSION}")
+
+
+@contextmanager
+def axiom_transaction(app):
+    app_writable(app)
+    with closing(axiom_db(app, "rw")) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version != AXIOM_DB_VERSION:
+            raise ValueError(f"база AxiOm версии {version} — только чтение; нужна версия {AXIOM_DB_VERSION}")
+        yield db
+
+
+def app_sub_name(row):
+    return "app:" + row["name"]
+
+
+def profile_file(app, profile_id):
+    if str(uuid.UUID(profile_id)) != profile_id.lower():
+        raise ValueError("недопустимый ID профиля AxiOm")
+    return app["root"] / "configs" / f"{profile_id}.json"
+
+
+def app_cache(app, row):
+    try:
+        text = profile_file(app, row["id"]).read_text(encoding="utf-8-sig")
+        servers, errors, _, _ = subscription_servers(text, app=True)
+        if errors:
+            warn(f"{app_sub_name(row)}: пропущено записей: {len(errors)}")
+        return servers, profile_group(text)
+    except (OSError, ValueError, TypeError, ImportError) as exc:
+        warn(f"{app_sub_name(row)}: конфиг не прочитан ({exc})")
+        return [], None
+
+
+def profile_group(text):
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get("outbounds"), list):
+        return None
+    outbounds = [entry for entry in document["outbounds"] if isinstance(entry, dict)]
+    tags = {entry["tag"] for entry in outbounds if entry.get("type") in PROXY_TYPES
+            and isinstance(entry.get("tag"), str)}
+    groups = [[tag for tag in entry["outbounds"] if isinstance(tag, str) and tag in tags]
+              for entry in outbounds if entry.get("type") in {"selector", "urltest"}
+              and isinstance(entry.get("outbounds"), list)]
+    group = max(groups, key=len, default=None)
+    return {tag: index for index, tag in enumerate(group)} if group else None
+
+
+def drift_date(timestamp):
+    try:
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
+def epoch_date(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00").replace(" +", "+"))
+            return int((parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp())
+        except (ValueError, OverflowError, OSError):
+            pass
+    return None
+
+
+def axiom_fetch(url):
+    if urllib.parse.urlsplit(url).scheme not in {"http", "https"}:
+        raise ValueError("профиль AxiOm должен иметь URL http:// или https://")
+    os_name = "windows" if IS_WIN else "linux"
+    ua = f"HiddifyNext/{AXIOM_UA_VERSION} ({os_name}) like ClashMeta v2ray sing-box"
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        body = response.read().decode("utf-8-sig", "replace")
+        headers = {}
+        for key in AXIOM_HEADERS:
+            values = [value for value in response.headers.get_all(key, []) if value]
+            if values:
+                headers[key] = values[0] if len(values) == 1 else values
+    decoded = b64decode(body) or body
+    for line in decoded.splitlines()[:10]:
+        match = re.match(r"^(?:#|//)\s*([^:]+):\s*(.+)$", line)
+        if match and (key := match[1].strip().lower()) in AXIOM_HEADERS:
+            headers.setdefault(key, match[2].strip())
+    return body, headers
+
+
+def metadata_int(value):
+    if isinstance(value, (str, int)) and str(value).isascii() and str(value).isdecimal() and len(str(value)) <= 19:
+        number = int(value)
+        if number <= 2 ** 63 - 1:
+            return number
+    return None
+
+
+def axiom_profile_metadata(url, headers, override):
+    def header(key):
+        value = headers.get(key)
+        return value if isinstance(value, str) else ""
+
+    title = header("profile-title").strip()
+    if title.startswith("base64:"):
+        title = b64decode(title[7:]) or ""
+    filename = re.search(r'filename="([^"]*)"', header("content-disposition"))
+    parsed = urllib.parse.urlsplit(url or "")
+    name = (override.get("name") or title or (filename[1] if filename else "") or parsed.fragment
+            or re.sub(r"\.(?:json|ya?ml|txt)$", "", parsed.path.rsplit("/", 1)[-1]) or "Remote Profile")
+    info = {}
+    for field in header("subscription-userinfo").split(";"):
+        key, _, value = field.strip().partition("=")
+        info[key.strip()] = metadata_int(value.strip())
+    upload, download, total = (info.get(key) for key in ("upload", "download", "total"))
+    expire = None
+    if upload is not None and download is not None:
+        total = total or 920233720369
+        expire = drift_date(info.get("expire") or 92233720368)
+    else:
+        upload = download = total = None
+    interval = None if override.get("isAutoUpdateDisable") else (
+        metadata_int(override.get("updateInterval")) or metadata_int(header("profile-update-interval")))
+    if interval is not None and interval > (2 ** 63 - 1) // 3600:
+        interval = None
+    profile_override = {}
+    if header("enable-warp") == "true" or override.get("enableWarp") is True:
+        profile_override.update({key: {"enable": True, "mode": "warp_over_proxy"} for key in ("warp", "warp2")})
+    if header("enable-fragment") == "true" or override.get("enableFragment") is True:
+        profile_override["tls-tricks"] = {"enable-fragment": True}
+    return {"name": name, "last_update": drift_date(time.time()), "update_interval": interval and interval * 3600,
+            "upload": upload, "download": download, "total": total, "expire": expire,
+            "web_page_url": header("profile-web-page-url") or None, "support_url": header("support-url") or None,
+            "populated_headers": json.dumps(headers, ensure_ascii=False),
+            "profile_override": json.dumps(profile_override, ensure_ascii=False)}
+
+
+def app_profile_content(body):
+    servers, errors, _, fmt = subscription_servers(body, app=True)
+    if not servers:
+        raise ValueError(f"в профиле нет поддерживаемых серверов ({fmt})")
+    if errors:
+        warn(f"профиль AxiOm: пропущено записей: {len(errors)}")
+    outbounds = [{**server["outbound"], "tag": server["name"]} for server in servers]
+    return json.dumps({"outbounds": outbounds}, ensure_ascii=False, indent=2)
+
+
+def unique_profile_name(db, base, profile_id):
+    taken = {row[0] for row in db.execute("SELECT name FROM profile_entries WHERE id != ?", (profile_id,))}
+    name, index = base, 2
+    while name in taken:
+        name = f"{base}{index}"
+        index += 1
+    return name
+
+
+def write_axiom_profile(app, *, name=None, url=None, local=None, current=None):
+    app_writable(app)
+    profile_id = current["id"] if current else str(uuid.uuid4())
+    body, headers = (Path(local).read_text(encoding="utf-8-sig"), {}) if local else axiom_fetch(url)
+    config = app_profile_content(body)
+    path = profile_file(app, profile_id)
+    previous = None
+    changed = False
+    try:
+        with axiom_transaction(app) as db:
+            if current:
+                row = db.execute("SELECT * FROM profile_entries WHERE id = ?", (profile_id,)).fetchone()
+                if row is None or row["url"] != url or row["last_update"] != current["last_update"]:
+                    raise ValueError("профиль изменён приложением AxiOm; повторите обновление")
+                override = json.loads(row["user_override"] or "{}")
+            else:
+                if url and db.execute("SELECT 1 FROM profile_entries WHERE instr(url, ?) > 0", (url,)).fetchone():
+                    raise ValueError("такая подписка уже есть в AxiOm")
+                override = {"version": 1, "name": name} if name else {}
+            fields = axiom_profile_metadata(url, headers, override)
+            fields["name"] = unique_profile_name(db, fields["name"], profile_id)
+            if current:
+                db.execute(f"UPDATE profile_entries SET {', '.join(key + ' = ?' for key in fields)} WHERE id = ?",
+                           (*fields.values(), profile_id))
+            else:
+                db.execute("UPDATE profile_entries SET active = 0 WHERE active = 1")
+                fields.update(id=profile_id, url=url, type="local" if local else "remote", active=1,
+                              user_override=json.dumps(override, ensure_ascii=False) if override else None)
+                db.execute(f"INSERT INTO profile_entries ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+                           tuple(fields.values()))
+            if path.exists():
+                previous = path.read_text(encoding="utf-8")
+            write_private(path, config)
+            changed = True
+    except BaseException:
+        if changed:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_private(path, previous)
+        raise
+    reload_axiom_profiles(app)
+    return "app:" + fields["name"]
+
+
+def update_app_profiles(app, profiles, quiet):
+    ok = True
+    if not any(profile.get("type") == "remote" for profile in profiles):
+        return True
+    app_writable(app)
+    for row in profiles:
+        if row.get("type") != "remote":
+            continue
+        try:
+            name = write_axiom_profile(app, url=row["url"], current=row)
+            if not quiet:
+                print(f"✓ {name}: обновлена")
+        except (OSError, sqlite3.Error, ValueError, TypeError, ImportError) as exc:
+            warn(f"{app_sub_name(row)}: не обновлена ({exc}); остаётся прошлый список")
+            ok = False
+    return ok
+
+
+def remove_app_profile(app, name):
+    with axiom_transaction(app) as db:
+        row = db.execute("SELECT id, active FROM profile_entries WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            raise ValueError(f"нет подписки app:{name}")
+        path = profile_file(app, row["id"])
+        db.execute("DELETE FROM profile_entries WHERE id = ?", (row["id"],))
+        if row["active"]:
+            db.execute("UPDATE profile_entries SET active = 1 WHERE id = (SELECT id FROM profile_entries LIMIT 1)")
+    path.unlink(missing_ok=True)
+    reload_axiom_profiles(app)
+
+
+def effective_route(st):
+    app = st.get("_axiom")
+    if app and app["root"]:
+        return "ru" if app["prefs"].get(app["prefix"] + "region", "ru") == "ru" else "global"
+    return st["settings"]["route"]
 
 
 GEO_URL = {
@@ -919,7 +1279,7 @@ def all_servers(st):
     """-> [{tag, outbound, source}] в стабильном порядке, теги уникальны."""
     out, seen = [], set()
 
-    def add(name, o, source):
+    def add(name, o, source, **details):
         tag = name.strip() or "server"
         if tag in seen or tag in ("proxy", "auto", "direct") or tag.startswith(VIA_PREFIX):
             base, n = f"{tag} [{source}]", 2
@@ -927,7 +1287,26 @@ def all_servers(st):
             while tag in seen:
                 tag, n = f"{base} #{n}", n + 1
         seen.add(tag)
-        out.append({"tag": tag, "outbound": o, "source": source})
+        out.append({"tag": tag, "outbound": o, "source": source, **details})
+        return tag
+
+    if app := st.get("_axiom"):
+        profiles = app["profiles"]
+        profile = next((row for row in profiles if row.get("active")), profiles[0] if profiles else None)
+        if profile:
+            servers, group = app_cache(app, profile)
+            aliases, entries = {}, []
+            for server in servers:
+                name = server["name"]
+                tag = add(name, server["outbound"], app_sub_name(profile), display=name, app_profile=True,
+                          app_group=group is None or name in group, app_order=group.get(name, 0) if group else 0)
+                aliases.setdefault(name, tag)
+                entries.append(out[-1])
+            for entry in entries:
+                if detour := entry["outbound"].get("detour"):
+                    if detour not in aliases and detour != "direct":
+                        raise ValueError(f"в профиле AxiOm не найден узел цепочки для «{entry['display']}»: {detour}")
+                    entry["outbound"] = {**entry["outbound"], "detour": aliases.get(detour, detour)}
 
     for sub in st["subs"]:
         for s in load_sub_cache(sub["name"])["servers"]:
@@ -935,6 +1314,99 @@ def all_servers(st):
     for s in st["manual"]:
         add(s["name"], s["outbound"], "manual")
     return out
+
+
+AXIOM_PROTOCOLS = {"vless": "VLESS", "hysteria2": "Hysteria2", "naive": "Naive", "shadowtls": "ShadowTLS"}
+AXIOM_TRANSPORTS = {"ws": "WebSocket", "tcp": "Reality (TCP)", "hy2": "QUIC", "naive": "HTTP/2 TLS",
+                    "stls": "ShadowTLS (TCP)"}
+AXIOM_TOKENS = {"ws": ("vless", "ws"), "tcp": ("vless", "tcp"),
+                **dict.fromkeys(("hy2", "hysteria2", "hysteria", "hy"), ("hysteria2", "hy2")),
+                **dict.fromkeys(("naive", "http"), ("naive", "naive")),
+                **dict.fromkeys(("stls", "shadowtls"), ("shadowtls", "stls"))}
+AXIOM_TAG = re.compile(r"^(.*?)\s*\([^)]*\)\s*\[((?ai:[a-z0-9]+))\]\s*$")
+AXIOM_COUNTRIES = {
+    "netherlands": "NL", "france": "FR", "russia": "RU", "poland": "PL", "germany": "DE",
+    "united states": "US", "usa": "US", "united kingdom": "GB", "uk": "GB", "finland": "FI",
+    "sweden": "SE", "norway": "NO", "turkey": "TR", "japan": "JP", "singapore": "SG", "canada": "CA",
+    "italy": "IT", "spain": "ES", "switzerland": "CH", "austria": "AT", "belgium": "BE", "czechia": "CZ",
+    "czech republic": "CZ", "romania": "RO", "ukraine": "UA", "kazakhstan": "KZ", "hong kong": "HK",
+    "taiwan": "TW", "south korea": "KR", "korea": "KR", "india": "IN", "brazil": "BR", "australia": "AU",
+    "israel": "IL", "uae": "AE", "united arab emirates": "AE", "ireland": "IE", "denmark": "DK",
+    "portugal": "PT", "hungary": "HU", "bulgaria": "BG", "serbia": "RS", "latvia": "LV", "lithuania": "LT",
+    "estonia": "EE", "moldova": "MD", "georgia": "GE", "armenia": "AM", "azerbaijan": "AZ",
+}
+
+
+def axiom_classify(display):
+    match = AXIOM_TAG.fullmatch(display.strip())
+    if match and (country := match[1].strip()) and (tokens := AXIOM_TOKENS.get(match[2].lower())):
+        return country, *tokens
+    return None
+
+
+def axiom_flag(country):
+    code = AXIOM_COUNTRIES.get(country.strip().lower())
+    return "".join(chr(ord(letter) + 127397) for letter in code) if code else "🏳️"
+
+
+def axiom_options(servers):
+    options = []
+    from_app = any(server.get("app_profile") for server in servers)
+    for server in sorted(servers, key=lambda item: item.get("app_order", 0)):
+        if from_app and not server.get("app_group"):
+            continue
+        if group := axiom_classify(server.get("display", server["tag"])):
+            options.append((group, server["tag"]))
+    return options
+
+
+def axiom_sorted(options):
+    unique = {}
+    for key, tag in options:
+        unique.setdefault(key, tag)
+    rank = list(AXIOM_PROTOCOLS)
+    return sorted(unique.items(), key=lambda entry: (entry[0][0].encode("utf-16-be"),
+                                                     rank.index(entry[0][1]), entry[0][2]))
+
+
+def axiom_fastest(options, latencies):
+    delays = [(latencies[tag], tag) for _, tag in options
+              if isinstance(latencies.get(tag), int) and 0 < latencies[tag] < 65000]
+    return min(delays, key=lambda entry: entry[0])[1] if delays else None
+
+
+def axiom_chosen(app, options):
+    country, protocol, transport = (app["prefs"].get(app["prefix"] + key) for key in AXIOM_PREFS)
+    if not country or country == AXIOM_AUTO:
+        return "auto"
+    countries = [(key, tag) for key, tag in axiom_sorted(options) if key[0] == country]
+    if not countries:
+        return "auto"
+    protocols = [(key, tag) for key, tag in countries if key[1] == protocol]
+    group = protocols or [(key, tag) for key, tag in countries if key[1] == countries[0][0][1]]
+    return next((tag for key, tag in group if key[2] == transport), group[0][1])
+
+
+def axiom_write_selection(app, choice):
+    if not app["root"]:
+        return
+    path = app["prefs_path"]
+    with axiom_transaction(app):
+        prefs = read_axiom_prefs(path)
+        keys = AXIOM_PREFS if choice else AXIOM_PREFS[:1]
+        for key, value in zip(keys, choice or (AXIOM_AUTO,)):
+            prefs[app["prefix"] + key] = value
+        write_private(path, json.dumps(prefs, ensure_ascii=False))
+    app["prefs"] = prefs
+
+
+def selected_server(st, servers):
+    app = st.get("_axiom")
+    if app and app["root"]:
+        options = axiom_options(servers)
+        if options:
+            return axiom_chosen(app, options)
+    return st["selected"]
 
 
 VIA_PREFIX = "via: "   # теги групп для via_rules вида re:… (имя сервера так начинаться не может)
@@ -972,12 +1444,15 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
     tun = cfg_s["mode"] == "tun" if tun is None else tun
     tags = [s["tag"] for s in servers]
     rx = cfg_s.get("auto_exclude")
-    auto = [t for t in tags if not (rx and re.search(rx, t, re.I))] or tags
-    selected = st["selected"] if st["selected"] in tags else "auto"
+    options = axiom_options(servers) if st.get("_axiom") else []
+    eligible = list(dict.fromkeys(tag for _, tag in options)) or tags
+    auto = [tag for tag in eligible if not (rx and re.search(rx, tag, re.I))] or eligible
+    selected = selected_server(st, servers)
+    selected = selected if selected in tags else "auto"
 
     have = {t: (RULESET_DIR / f"{t}.srs") for t in RULESETS}
     have = {t: p for t, p in have.items() if p.exists()}
-    ru = cfg_s["route"] == "ru" and have
+    ru = effective_route(st) == "ru" and have
 
     dns_remote = urllib.parse.urlsplit(cfg_s["dns_remote"])
     dns = {
@@ -1066,7 +1541,7 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
         {"type": "selector", "tag": "proxy", "outbounds": ["auto", *tags], "default": selected,
          "interrupt_exist_connections": True},
         {"type": "urltest", "tag": "auto", "outbounds": auto, "url": cfg_s["test_url"],
-         "interval": "5m", "tolerance": 50},
+         "interval": "5m", "tolerance": 1 if options else 50},
         *extra_out,
         *({**s["outbound"], "tag": s["tag"]} for s in servers),
         {"type": "direct", "tag": "direct"},
@@ -1220,7 +1695,17 @@ WantedBy=multi-user.target
 
 def timer_units():
     user = os.environ.get("SUDO_USER") or os.environ.get("USER") or HOME.name
-    exe = Path(__file__).resolve()
+    exe = Path(sys.argv[0]).absolute() if axiom_mode() else Path(__file__).resolve()
+    args = "sub update" if axiom_mode() else "update"
+    env = {key: os.environ[key] for key in ("SBX_HOME", "SBX_AXIOM_HOME", "SBX_SING_BOX", "XDG_DATA_HOME")
+           if os.environ.get(key)}
+    if axiom_mode():
+        env["SBX_BRAND"] = "axiom"
+
+    def quote(value):
+        return json.dumps(str(value).replace("%", "%%"), ensure_ascii=False)
+
+    settings = "".join(f"Environment={quote(key + '=' + value)}\n" for key, value in env.items())
     svc = f"""[Unit]
 Description=sbx — обновление подписок
 After=network-online.target
@@ -1229,7 +1714,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User={user}
-ExecStart=/usr/bin/python3 {exe} update --quiet
+{settings}ExecStart=/usr/bin/python3 {quote(exe)} {args} --quiet
 """
     tmr = """[Unit]
 Description=sbx — обновление подписок по расписанию
@@ -1419,7 +1904,8 @@ def install_windows_tasks(st, quiet=False):
     if not runtime.exists():
         runtime.mkdir(parents=True)
         run(["icacls", str(runtime), "/inheritance:r", "/grant:r",
-             "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", f"*{windows_user_sid()}:(OI)(CI)RX"],
+             "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-3-4:(OI)(CI)RX",
+             f"*{windows_user_sid()}:(OI)(CI)RX"],
             capture_output=True)
     # SYSTEM использует отдельное ядро и конфиг из защищённого каталога.
     if not (runtime / "sing-box.exe").exists():
@@ -1443,12 +1929,16 @@ def windows_user_sid():
 
 
 def register_windows_updater():
-    register_task("sbx-update", task_xml(launch_command(["update", "-q"]), windows_user_sid()))
+    args = ["sub", "update", "-q"] if axiom_mode() else ["update", "-q"]
+    argv = launch_command(["--axiom", *args] if axiom_mode() else args)
+    register_task("sbx-update", task_xml(argv, windows_user_sid()))
 
 
 def prepare_service(st):
     if not IS_WIN:
         apply(st, reload=False)
+    if not all_servers(st):
+        die("серверов нет: добавьте подписку (sbx sub add) или сервер (sbx add)")
     install_units(st)
 
 
@@ -1472,7 +1962,20 @@ def service_action(action):
 # ─── команды ──────────────────────────────────────────────────────────────────
 
 def cmd_sub(st, a):
+    app = st.get("_axiom")
+    shared = app and app["root"]
     if a.action == "add":
+        if shared:
+            if a.ua or a.no_hwid:
+                warn("профили приложения всегда используют User-Agent AxiOm, без HWID")
+            name = write_axiom_profile(app, name=a.name, url=a.url)
+            print(f"✓ {name}: добавлена")
+            update_rulesets(st)
+            apply(st)
+            return
+        if app:
+            warn("база AxiOm не найдена; подписка будет локальной для sbx")
+        sub_file(a.name)
         if any(s["name"] == a.name for s in st["subs"]):
             die(f"подписка {a.name} уже есть (sbx sub rm {a.name})")
         sub = {"name": a.name, "url": a.url, "hwid": not a.no_hwid}
@@ -1485,6 +1988,12 @@ def cmd_sub(st, a):
             return
         apply(st)
     elif a.action == "rm":
+        if shared and a.name.startswith("app:"):
+            remove_app_profile(app, a.name[4:])
+            if all_servers(st):
+                apply(st)
+            print(f"✓ подписка {a.name} удалена")
+            return
         before = len(st["subs"])
         st["subs"] = [s for s in st["subs"] if s["name"] != a.name]
         if len(st["subs"]) == before:
@@ -1495,28 +2004,38 @@ def cmd_sub(st, a):
             apply(st)
         print(f"✓ подписка {a.name} удалена")
     else:
-        if not st["subs"]:
+        profiles = app["profiles"] if app else []
+        if not st["subs"] and not profiles:
             print("подписок нет: sbx sub add ИМЯ URL")
+        for row in profiles:
+            servers, _ = app_cache(app, row)
+            metadata = {key: row.get(key) or 0 for key in ("upload", "download", "total")}
+            metadata.update(updated=epoch_date(row.get("last_update")), expire=epoch_date(row.get("expire")))
+            name = app_sub_name(row) + (" (активна)" if row.get("active") else "")
+            show_subscription(name, len(servers), metadata, row.get("url") if a.verbose else None)
         for s in st["subs"]:
             c = load_sub_cache(s["name"])
-            m = c["meta"]
-            line = f"{s['name']}: {len(c['servers'])} серверов"
-            if m.get("title"):
-                line += f" · {m['title']}"
-            if m.get("updated"):
-                line += f" · обновлена {time.strftime('%d.%m %H:%M', time.localtime(m['updated']))}"
-            print(line)
-            used = m.get("upload", 0) + m.get("download", 0)
-            if m.get("total"):
-                print(f"    трафик {human_bytes(used)} из {human_bytes(m['total'])}")
-            elif used:
-                print(f"    трафик {human_bytes(used)}")
-            if m.get("expire"):
-                days = (m["expire"] - time.time()) / 86400
-                print(f"    до {time.strftime('%d.%m.%Y', time.localtime(m['expire']))} "
-                      f"(осталось {days:.0f} дн.)")
-            if a.verbose:
-                print(f"    {s['url']}")
+            show_subscription(s["name"], len(c["servers"]), c["meta"],
+                              (s.get("url") or s.get("local_path")) if a.verbose else None)
+
+
+def show_subscription(name, count, meta, location):
+    line = f"{name}: {count} серверов"
+    if meta.get("title"):
+        line += f" · {meta['title']}"
+    if meta.get("updated"):
+        line += f" · обновлена {time.strftime('%d.%m %H:%M', time.localtime(meta['updated']))}"
+    print(line)
+    used = meta.get("upload", 0) + meta.get("download", 0)
+    if meta.get("total"):
+        print(f"    трафик {human_bytes(used)} из {human_bytes(meta['total'])}")
+    elif used:
+        print(f"    трафик {human_bytes(used)}")
+    if meta.get("expire"):
+        days = (meta["expire"] - time.time()) / 86400
+        print(f"    до {time.strftime('%d.%m.%Y', time.localtime(meta['expire']))} (осталось {days:.0f} дн.)")
+    if location:
+        print(f"    {location}")
 
 
 def cmd_update(st, a):
@@ -1556,10 +2075,14 @@ def cmd_rm(st, a):
     print(f"✓ удалён {tag}")
 
 
-def resolve(st, query, allow_auto=True):
+def resolve(st, query, allow_auto=True, *, use_axiom=False):
     servers = all_servers(st)
-    if allow_auto and query.lower() == "auto":
+    if allow_auto and query.lower() in {"auto", "0"}:
         return "auto"
+    options = axiom_sorted(axiom_options(servers)) if use_axiom and st.get("_axiom") else []
+    if options:
+        by_tag = {server["tag"]: server for server in servers}
+        servers = [by_tag[tag] for _, tag in options]
     if query.isdigit():
         i = int(query)
         if 1 <= i <= len(servers):
@@ -1581,6 +2104,12 @@ def cmd_ls(st, a):
     if not servers:
         print("серверов нет: sbx sub add ИМЯ URL")
         return
+    if st.get("_axiom") and (options := axiom_options(servers)):
+        ls_axiom(st, servers, options, a.filter)
+        return
+    if st.get("_axiom"):
+        print("нет серверов, подходящих для выбора по стране в AxiOm")
+        return
     now = current_node(st) if is_active(st) else None
     live = now.split(" → ")[-1] if now else None
     sel = st["selected"]
@@ -1599,13 +2128,52 @@ def cmd_ls(st, a):
 
 
 def cmd_use(st, a):
-    tag = resolve(st, a.server)
+    tag = resolve(st, a.server, use_axiom=True)
+    app = st.get("_axiom")
+    if app:
+        options = axiom_options(all_servers(st))
+        choice = next((key for key, node in options if node == tag), None)
+        if tag == "auto" or choice:
+            axiom_write_selection(app, choice)
     st["selected"] = tag
     save_state(st)
     apply(st, reload=False)
     if is_active(st) and api_up(st):
         api(st, "PUT", "/proxies/proxy", {"name": tag})
+
+    if IS_WIN and interactive() and task_definition("sbx") is not None:
+        warn("для сохранения выбора после перезагрузки задачи SYSTEM: sbx restart")
     print(f"✓ выбран {tag}")
+
+
+def ls_axiom(st, servers, options, query):
+    latencies = dict(st["latency"])
+    if is_active(st):
+        try:
+            proxies = api(st, "GET", "/proxies")["proxies"]
+            for _, tag in options:
+                history = proxies.get(tag, {}).get("history", [])
+                if history:
+                    latencies[tag] = history[-1]["delay"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    selected = selected_server(st, servers)
+    best = axiom_fastest(options, latencies)
+    print(f"{'●' if selected == 'auto' else ' '}   0  Авто (самый быстрый)" + (f" → {best}" if best else ""))
+    previous = ()
+    for index, (key, tag) in enumerate(axiom_sorted(options), 1):
+        if query and query.lower() not in tag.lower():
+            continue
+        country, protocol, transport = key
+        if previous[:1] != key[:1]:
+            print(f"{axiom_flag(country)} {country}")
+        if previous[:2] != key[:2]:
+            print(f"     {AXIOM_PROTOCOLS[protocol]}")
+        previous = key
+        mark = "●" if selected == tag else "›" if selected == "auto" and best == tag else " "
+        delay = latencies.get(tag, 0)
+        detail = f" · {delay} мс" if isinstance(delay, int) and 0 < delay < 65000 else ""
+        print(f"{mark}   {index:>2}  {AXIOM_TRANSPORTS[transport]}{detail}")
 
 
 class Prober:
@@ -1668,6 +2236,15 @@ class Prober:
 
 def cmd_test(st, a):
     servers = all_servers(st)
+    if st.get("_axiom"):
+        options = axiom_sorted(axiom_options(servers))
+        if options:
+            indices = {tag: index for index, (_, tag) in enumerate(options, 1)}
+            servers = [server for server in servers if server["tag"] in indices]
+        else:
+            indices = {}
+    else:
+        indices = {}
     if a.filter:
         servers = [s for s in servers if a.filter.lower() in s["tag"].lower()]
     if not servers:
@@ -1687,7 +2264,7 @@ def cmd_test(st, a):
         prober.close()
     st["latency"].update(results)
     save_state(st)
-    idx = {s["tag"]: i for i, s in enumerate(all_servers(st), 1)}
+    idx = indices or {s["tag"]: i for i, s in enumerate(all_servers(st), 1)}
     for tag, ms in sorted(results.items(), key=lambda r: (r[1] < 0, r[1])):
         print(f"{idx[tag]:>4}  {tag:<34} {'недоступен' if ms < 0 else f'{ms} мс':>10}")
 
@@ -1726,6 +2303,38 @@ def numbered_choice(options):
     return options[int(answer)]
 
 
+def pick_axiom(options):
+    options = axiom_sorted(options)
+    countries = list(dict.fromkeys(key[0] for key, _ in options))
+    print("  0  Авто (самый быстрый)")
+    print("Страна:")
+    for index, country in enumerate(countries, 1):
+        print(f"{index:>3}  {axiom_flag(country)} {country}")
+    country = numbered_choice({0: AXIOM_AUTO, **dict(enumerate(countries, 1))})
+    if country is None:
+        return None
+    if country == AXIOM_AUTO:
+        return "auto"
+    options = [(key, tag) for key, tag in options if key[0] == country]
+    protocols = list(dict.fromkeys(key[1] for key, _ in options))
+    if len(protocols) > 1:
+        print("Протокол:")
+        for index, protocol in enumerate(protocols, 1):
+            print(f"{index:>3}  {AXIOM_PROTOCOLS[protocol]}")
+        protocol = numbered_choice(dict(enumerate(protocols, 1)))
+        if protocol is None:
+            return None
+    else:
+        protocol = protocols[0]
+    transports = [(key[2], tag) for key, tag in options if key[1] == protocol]
+    if len(transports) == 1:
+        return transports[0][1]
+    print("Транспорт:")
+    for index, (transport, _) in enumerate(transports, 1):
+        print(f"{index:>3}  {AXIOM_TRANSPORTS[transport]}")
+    return numbered_choice({index: tag for index, (_, tag) in enumerate(transports, 1)})
+
+
 def cmd_pick(st, a):
     """Интерактивный выбор: ↑↓ листать, пробел — пинг, a — пинг всех, Enter — выбрать."""
     try:
@@ -1736,6 +2345,14 @@ def cmd_pick(st, a):
     servers = all_servers(st)
     if not servers:
         die("серверов нет: sbx sub add ИМЯ URL")
+    if st.get("_axiom"):
+        options = axiom_options(servers)
+        if options:
+            choice = pick_axiom(options)
+            if choice is not None:
+                cmd_use(st, argparse.Namespace(server=choice))
+            return choice
+        die("нет серверов, подходящих для выбора по стране в AxiOm; можно выбрать auto")
     if curses is None or not interactive() or not os.environ.get("TERM") and not IS_WIN:
         options = {0: "auto", **{index: server["tag"] for index, server in enumerate(servers, 1)}}
         for index, tag in options.items():
@@ -2019,8 +2636,9 @@ def show_status(st):
     print(f"состояние:   {'работает' if active else 'выключен'}"
           f"  (автозапуск: {'да' if enabled == 'enabled' else 'нет'})")
     print(f"режим:       {'TUN + ' if s['mode'] == 'tun' else ''}прокси 127.0.0.1:{s['mixed_port']}"
-          f" · маршрут {s['route']}")
-    print(f"выбран:      {st['selected']}")
+          f" · маршрут {effective_route(st)}")
+    selected = selected_server(st, all_servers(st)) if st.get("_axiom") else st["selected"]
+    print(f"выбран:      {selected}")
     if active:
         node = current_node(st)
         if node:
@@ -2036,7 +2654,8 @@ def show_status(st):
         except (urllib.error.URLError, OSError, ValueError):
             pass
     t = task_enabled("sbx-update") if IS_WIN else unit_prop_of("sbx-update.timer", "UnitFileState")
-    print(f"обновление:  {'по таймеру раз в 6 ч' if t == 'enabled' else 'вручную (sbx update)'}")
+    manual = "вручную (axiom sub update)" if st.get("_axiom") else "вручную (sbx update)"
+    print(f"обновление:  {'по таймеру раз в 6 ч' if t == 'enabled' else manual}")
 
 
 def unit_prop_of(unit, prop):
@@ -2128,12 +2747,14 @@ def cmd_mode(st, a):
 
 def cmd_route(st, a):
     if a.route:
+        if (app := st.get("_axiom")) and app["root"]:
+            die("маршрут читается из региона приложения AxiOm; измените регион в приложении")
         st["settings"]["route"] = a.route
         save_state(st)
         if a.route == "ru":
             update_rulesets(st)
         apply(st)
-    print(st["settings"]["route"])
+    print(effective_route(st))
 
 
 DOMAIN_KEYS = ("proxy_domains", "direct_domains")
@@ -2294,8 +2915,9 @@ def cmd_rule(st, a):
             print(f"{title}: {', '.join(items) if items else '—'}")
         for v in s.get("via_rules", []):
             print(f"через {via_label(st, v['to'])}: {', '.join(v['items'])}")
-        print(f"остальное: route {s['route']}"
-              + (" (российское напрямую, прочее через VPN)" if s["route"] == "ru" else " (всё через VPN)"))
+        route = effective_route(st)
+        print(f"остальное: route {route}"
+              + (" (российское напрямую, прочее через VPN)" if route == "ru" else " (всё через VPN)"))
         print("порядок: напрямую → proxy → via → route; первое совпадение побеждает")
         return
     to = None
@@ -2362,26 +2984,116 @@ def cmd_config(st, a):
     else:
         ok, err = check_config(CONFIG_FILE)
         print(f"{CONFIG_FILE}: {'ok' if ok else err}")
+        if not ok:
+            sys.exit(1)
 
 
-def main():
+GUIDE = {
+    "start": "Сохраните подписку: axiom import URL. Затем axiom connect. Для отключения: axiom disconnect.",
+    "commands": "Список команд: axiom --help. Серверы: axiom ls. Подписки: axiom sub ls.",
+    "windows": "Скачайте sbx-windows-amd64.exe и переименуйте в axiom.exe. Ядро: axiom core install. Для TUN нужен UAC.",
+    "linux": "Установите sing-box и Python 3.9+. Сохраните sbx.py как axiom в PATH и добавьте право на запуск.",
+    "tun": "Режим tun направляет трафик всей системы через VPN. Перед подключением закройте другой TUN-клиент.",
+    "update": "Версия CLI: axiom update --check, установка: axiom update. Подписки: axiom sub update.",
+    "troubleshoot": "Проверьте axiom status, axiom log и axiom config. Задержки без TUN: axiom test.",
+}
+
+
+def cmd_guide(st, a):
+    print(GUIDE[a.topic])
+    if a.topic == "start":
+        print("Темы: " + ", ".join(GUIDE))
+
+
+def import_name(url):
+    host = urllib.parse.urlsplit(url).hostname
+    return re.sub(r'[^a-zA-Z0-9._-]', '-', host).strip('.') if host else "axiom"
+
+
+def cmd_import(st, a):
+    source = a.source
+    if urllib.parse.urlsplit(source).scheme.lower() in {"http", "https"}:
+        name = import_name(source) or "axiom"
+        taken = {sub["name"] for sub in st["subs"]}
+        base, index = name, 2
+        while name in taken:
+            name = f"{base}-{index}"
+            index += 1
+        cmd_sub(st, argparse.Namespace(action="add", name=name, url=source, ua=None, no_hwid=False))
+        return
+    path = Path(source).expanduser().resolve(strict=True)
+    if (app := st.get("_axiom")) and app["root"]:
+        name = write_axiom_profile(app, name="axiom", local=path)
+        print(f"✓ {name}: импортирована")
+        apply(st)
+        return
+    name, index = "axiom", 2
+    taken = {sub["name"] for sub in st["subs"]}
+    while name in taken:
+        name, index = f"axiom-{index}", index + 1
+    sub = {"name": name, "local_path": str(path)}
+    servers, errors, _, meta = fetch_sub(st, sub)
+    if not servers:
+        die("в файле нет поддерживаемых серверов")
+    if errors:
+        warn(f"в файле пропущено записей: {len(errors)}")
+    write_private(sub_file(name), json.dumps({"servers": servers, "meta": meta}, ensure_ascii=False, indent=1))
+    st["subs"].append(sub)
+    save_state(st)
+    apply(st)
+    print(f"✓ {name}: импортирована")
+
+
+def cmd_connect(st, a):
+    if a.number is not None:
+        cmd_use(st, argparse.Namespace(server=str(a.number)))
+    elif interactive() and cmd_pick(st, a) is None:
+        return
+    cmd_up(st, argparse.Namespace(force=False))
+
+
+def update_arguments(parser, *, self_update=False):
+    if self_update:
+        parser.add_argument("--check", action="store_true", help="только проверить")
+        parser.add_argument("--yes", action="store_true", help="установить без вопроса")
+    else:
+        parser.add_argument("names", nargs="*")
+        parser.add_argument("-q", "--quiet", action="store_true")
+    parser.set_defaults(func=cmd_self_update if self_update else cmd_update)
+
+
+def main(argv=None):
     remove_old_exe()
-    p = argparse.ArgumentParser(prog="sbx", description=__doc__.split("\n")[0],
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--axiom"]:
+        os.environ["SBX_BRAND"] = "axiom"
+        argv.pop(0)
+    branded = axiom_mode()
+    prog = "axiom" if branded else "sbx"
+    p = argparse.ArgumentParser(prog=prog, description=__doc__.split("\n")[0],
                                 epilog=__doc__.split("\n\n", 1)[1],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-V", "--version", action="version", version=f"sbx {__version__}")
+    p.add_argument("-V", "--version", action="version", version=f"{prog} {__version__}")
     sp = p.add_subparsers(dest="cmd", metavar="команда")
 
-    x = sp.add_parser("self-update", help="обновить сам sbx из GitHub Releases")
-    x.add_argument("--check", action="store_true", help="только проверить")
-    x.add_argument("--yes", action="store_true", help="установить без вопроса")
-    x.set_defaults(func=cmd_self_update)
+    update_arguments(sp.add_parser("self-update", help="обновить сам sbx из GitHub Releases"), self_update=True)
+    sp.add_parser("version", help="версия CLI").set_defaults(func=lambda st, a: print(f"{prog} {__version__}"))
+    x = sp.add_parser("guide", help="краткое руководство")
+    x.add_argument("topic", nargs="?", choices=GUIDE, default="start")
+    x.set_defaults(func=cmd_guide)
+    x = sp.add_parser("import", help="импорт подписки по URL или из файла")
+    x.add_argument("source")
+    x.set_defaults(func=cmd_import)
+    x = sp.add_parser("connect", help="выбрать сервер и подключиться; 0 — авто")
+    x.add_argument("number", nargs="?", type=int)
+    x.set_defaults(func=cmd_connect)
 
     x = sp.add_parser("core", help="установка ядра sing-box (Windows)")
     x.add_argument("action", choices=["install"])
     x.set_defaults(func=cmd_core)
 
-    s = sp.add_parser("sub", help="подписки: ls | add ИМЯ URL | rm ИМЯ")
+    s = sp.add_parser("sub", help="подписки: ls | add ИМЯ URL | rm ИМЯ | update")
+    s.set_defaults(func=cmd_sub, action="ls", verbose=False)
     ssp = s.add_subparsers(dest="action")
     x = ssp.add_parser("add", help="добавить подписку и скачать")
     x.add_argument("name")
@@ -2392,12 +3104,8 @@ def main():
     x.add_argument("name")
     x = ssp.add_parser("ls", help="список с трафиком и сроком")
     x.add_argument("-v", "--verbose", action="store_true", help="показать URL")
-    s.set_defaults(func=cmd_sub, action="ls", verbose=False)
-
-    x = sp.add_parser("update", help="обновить подписки (все или указанные)")
-    x.add_argument("names", nargs="*")
-    x.add_argument("-q", "--quiet", action="store_true")
-    x.set_defaults(func=cmd_update)
+    update_arguments(ssp.add_parser("update", help="обновить подписки (все или указанные)"))
+    update_arguments(sp.add_parser("update", help="обновить CLI" if branded else "обновить подписки"), self_update=branded)
 
     x = sp.add_parser("add", help="добавить сервер(ы) по URI без подписки")
     x.add_argument("uris", nargs="+")
@@ -2426,7 +3134,7 @@ def main():
     x = sp.add_parser("up", help="включить VPN")
     x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
     x.set_defaults(func=cmd_up)
-    sp.add_parser("down", help="выключить VPN").set_defaults(func=cmd_down)
+    sp.add_parser("down", aliases=["disconnect"], help="выключить VPN").set_defaults(func=cmd_down)
     sp.add_parser("restart", help="перезапустить").set_defaults(func=cmd_restart)
     sp.add_parser("status", help="состояние").set_defaults(func=cmd_status)
     sp.add_parser("ip", help="внешний IP через VPN").set_defaults(func=cmd_ip)
@@ -2470,18 +3178,24 @@ def main():
     sp.add_parser("install", help="(пере)установить службу или задачи").set_defaults(func=cmd_install)
     sp.add_parser("uninstall", help="удалить службу или задачи, данные оставить").set_defaults(func=cmd_uninstall)
 
-    a = p.parse_args()
+    a = p.parse_args(argv)
     if not a.cmd:
         a = p.parse_args(["status"])
-    st = load_state()
-    if not STATE_FILE.exists():
-        save_state(st)
     try:
-        maybe_notice_update(st, a)
+        if a.cmd in {"version", "guide"} or a.func is cmd_self_update:
+            a.func(None, a)
+            return
+        st = load_state()
+        if branded:
+            st["_axiom"] = load_axiom_context()
+        if not STATE_FILE.exists():
+            save_state(st)
+        if a.cmd != "core":
+            maybe_notice_update(st, a)
         a.func(st, a)
     except subprocess.CalledProcessError as e:
         die(f"команда завершилась с ошибкой: {' '.join(map(str, e.cmd))}")
-    except (OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as e:
+    except (OSError, ValueError, KeyError, ImportError, sqlite3.Error, zipfile.BadZipFile, ET.ParseError) as e:
         die(str(e))
     except KeyboardInterrupt:
         sys.exit(130)
