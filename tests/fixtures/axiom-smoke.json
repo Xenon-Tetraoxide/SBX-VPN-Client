@@ -1,0 +1,27 @@
+{
+  "outbounds": [
+    {
+      "tag": "Netherlands (Arco) [ws]",
+      "type": "vless",
+      "server": "nl.example",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "transport": {"type": "ws", "path": "/vpn"}
+    },
+    {
+      "tag": "France (x) [hy2]",
+      "type": "hysteria2",
+      "server": "fr.example",
+      "server_port": 443,
+      "password": "fixture",
+      "tls": {"enabled": true, "server_name": "fr.example"}
+    },
+    {
+      "tag": "Germany (x) [reality]",
+      "type": "socks",
+      "server": "de.example",
+      "server_port": 1080,
+      "version": "5"
+    }
+  ]
+}

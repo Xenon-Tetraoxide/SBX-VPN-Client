@@ -1,0 +1,35 @@
+name: Windows smoke
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - sbx.py
+      - 'tests/**'
+      - '.github/workflows/*'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    env:
+      SBX_NO_UPDATE_CHECK: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Проверить версию и установить ядро
+        run: |
+          $env:SBX_HOME = Join-Path $env:RUNNER_TEMP 'sbx smoke'
+          "SBX_HOME=$env:SBX_HOME" >> $env:GITHUB_ENV
+          python sbx.py --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python sbx.py core install
+      - name: Проверить конфиг sing-box и классификацию AxiOm
+        run: python -m tests.windows_smoke

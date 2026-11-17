@@ -7,7 +7,7 @@ import zipfile
 import pytest
 
 import sbx
-from test_config import fixture_config
+from tests.test_config import fixture_config
 
 
 def test_windows_paths_and_commands(monkeypatch, tmp_path):
