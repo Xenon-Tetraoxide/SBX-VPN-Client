@@ -46,6 +46,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -344,6 +345,133 @@ def require_windows_admin(argv=None):
         request_windows_admin(sys.argv[1:] if argv is None else argv)
         return False
     return True
+
+
+RELEASES_URL = "https://api.github.com/repos/Xenon-Tetraoxide/SBX-VPN-Client/releases/latest"
+UPDATE_PERIOD = 24 * 60 * 60
+RELEASE_VERSION = re.compile(r"^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9a-zA-Z.-]+))?(?:\+[0-9a-zA-Z.-]+)?$")
+
+
+def version_key(version):
+    match = RELEASE_VERSION.fullmatch(version.strip())
+    if not match:
+        raise ValueError(f"неизвестный формат версии: {version}")
+    major, minor, patch, suffix = match.groups()
+    prerelease = tuple((0, int(part)) if part.isdigit() else (1, part)
+                       for part in suffix.split(".")) if suffix else ()
+    return int(major), int(minor), int(patch), not suffix, prerelease
+
+
+def latest_update():
+    release = release_json(os.environ.get("SBX_RELEASES_URL") or RELEASES_URL)
+    return release if version_key(release["tag_name"]) > version_key(__version__) else None
+
+
+def frozen_windows():
+    return IS_WIN and getattr(sys, "frozen", False)
+
+
+def update_target():
+    return Path(sys.executable if frozen_windows() else __file__).resolve()
+
+
+def remove_old_exe():
+    if frozen_windows():
+        target = update_target()
+        try:
+            target.with_name(target.name + ".old").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def replace_update(download, target, executable):
+    mode = stat.S_IMODE(target.stat().st_mode)
+    with tempfile.TemporaryDirectory(dir=target.parent) as directory:
+        stage = Path(directory) / target.name
+        shutil.copyfile(download, stage)
+        if not IS_WIN:
+            stage.chmod(mode)
+        if not executable:
+            os.replace(stage, target)
+            return
+        backup = target.with_name(target.name + ".old")
+        os.replace(target, backup)
+        try:
+            os.replace(stage, target)
+        except OSError:
+            os.replace(backup, target)
+            raise
+
+
+def sudo_replace_update(download, target):
+    mode = f"{stat.S_IMODE(target.stat().st_mode):04o}"
+    temp = run(["sudo", "mktemp", "--tmpdir", str(target.parent), ".sbx-update.XXXXXXXX"],
+               capture_output=True).stdout.strip()
+    try:
+        run(["sudo", "install", "-m", mode, "--", str(download), temp])
+        run(["sudo", "mv", "-T", "--", temp, str(target)])
+    finally:
+        run(["sudo", "rm", "-f", "--", temp], check=False)
+
+
+def install_update(release):
+    executable = frozen_windows()
+    name = "sbx-windows-amd64.exe" if executable else "sbx.py"
+    asset = next((entry for entry in release["assets"] if entry["name"] == name), None)
+    if not asset:
+        raise ValueError(f"в релизе {release['tag_name']} нет {name}")
+    target = update_target()
+    with tempfile.TemporaryDirectory() as directory:
+        download = Path(directory) / name
+        download_asset(asset, download, require_digest=True)
+        try:
+            replace_update(download, target, executable)
+        except PermissionError:
+            if IS_WIN:
+                if not require_windows_admin(["self-update", "--yes"]):
+                    return
+                raise
+            sudo_replace_update(download, target)
+    print(f"✓ установлена версия {release['tag_name']}: {target}")
+
+
+def update_prompt(release):
+    version = release["tag_name"].removeprefix("v")
+    try:
+        answer = input(f"Доступна новая версия sbx {version} (у вас {__version__}). "
+                       "Установить сейчас? [Y/n] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("", "y", "yes", "д", "да")
+
+
+def cmd_self_update(st, a):
+    release = latest_update()
+    if not release:
+        print(f"Уже установлена актуальная версия sbx {__version__}")
+    elif a.check:
+        print(f"Доступна новая версия sbx {release['tag_name'].removeprefix('v')} (у вас {__version__})")
+    elif a.yes or interactive() and update_prompt(release):
+        install_update(release)
+    elif not interactive():
+        die("без терминала укажите --yes для установки или --check для проверки")
+
+
+def maybe_notice_update(st, a):
+    if (not interactive() or getattr(a, "quiet", False) or a.cmd == "self-update"
+            or os.environ.get("SBX_NO_UPDATE_CHECK") == "1" or os.environ.get("INVOCATION_ID")):
+        return
+    now = int(time.time())
+    if now - st.get("last_update_check", 0) < UPDATE_PERIOD:
+        return
+    st["last_update_check"] = now
+    try:
+        save_state(st)
+        release = latest_update()
+        if release and update_prompt(release):
+            install_update(release)
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as e:
+        warn(f"не удалось проверить или установить обновление: {e}")
 
 
 def human_bytes(n):
@@ -2237,11 +2365,17 @@ def cmd_config(st, a):
 
 
 def main():
+    remove_old_exe()
     p = argparse.ArgumentParser(prog="sbx", description=__doc__.split("\n")[0],
                                 epilog=__doc__.split("\n\n", 1)[1],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-V", "--version", action="version", version=f"sbx {__version__}")
     sp = p.add_subparsers(dest="cmd", metavar="команда")
+
+    x = sp.add_parser("self-update", help="обновить сам sbx из GitHub Releases")
+    x.add_argument("--check", action="store_true", help="только проверить")
+    x.add_argument("--yes", action="store_true", help="установить без вопроса")
+    x.set_defaults(func=cmd_self_update)
 
     x = sp.add_parser("core", help="установка ядра sing-box (Windows)")
     x.add_argument("action", choices=["install"])
@@ -2343,6 +2477,7 @@ def main():
     if not STATE_FILE.exists():
         save_state(st)
     try:
+        maybe_notice_update(st, a)
         a.func(st, a)
     except subprocess.CalledProcessError as e:
         die(f"команда завершилась с ошибкой: {' '.join(map(str, e.cmd))}")
