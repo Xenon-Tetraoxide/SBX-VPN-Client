@@ -117,8 +117,12 @@ def test_elevated_arguments_forward_environment(monkeypatch):
     monkeypatch.setenv('SBX_AXIOM_HOME', 'C:/a')
     monkeypatch.setenv('SBX_SING_BOX', 'C:/s.exe')
     monkeypatch.setenv('SBX_BRAND', 'axiom')
-    assert sbx.elevated_arguments() == ['--elevated-for', 'S-1-5-21-1', '--sbx-home', 'C:/h',
-                                        '--axiom-home', 'C:/a', '--sing-box', 'C:/s.exe', '--axiom']
+    monkeypatch.setattr(sbx, 'interactive', lambda: True)
+    assert sbx.elevated_arguments() == ['--elevated-for', 'S-1-5-21-1', '--elevated-interactive', '1',
+                                        '--sbx-home', 'C:/h', '--axiom-home', 'C:/a',
+                                        '--sing-box', 'C:/s.exe', '--axiom']
+    monkeypatch.setattr(sbx, 'interactive', lambda: False)
+    assert sbx.elevated_arguments()[2:4] == ['--elevated-interactive', '0']
 
 
 def test_request_windows_admin_runs_visible_child_and_exits_with_its_code(monkeypatch, capsys):
@@ -180,16 +184,22 @@ def test_elevated_child_pauses_only_on_failure_with_a_console(monkeypatch, capsy
     monkeypatch.setattr(sbx, 'run_cli', fake_cli)
     try:
         with pytest.raises(SystemExit) as raised:
-            sbx.main(['--elevated-for', 'S-1-5-21-1', 'up'])
+            sbx.main(['--elevated-for', 'S-1-5-21-1', '--elevated-interactive', '1', 'up'])
         assert raised.value.code == 3 and len(answers) == 1
         assert 'сломалось' in capsys.readouterr().err
         outcome['code'] = 0
-        sbx.main(['--elevated-for', 'S-1-5-21-1', 'up'])
+        sbx.main(['--elevated-for', 'S-1-5-21-1', '--elevated-interactive', '1', 'up'])
         assert len(answers) == 1                        # успех — без паузы
         outcome['code'] = 4
+        with pytest.raises(SystemExit) as raised:       # родитель без человека (скрипт): код сразу, без Enter
+            sbx.main(['--elevated-for', 'S-1-5-21-1', '--elevated-interactive', '0', 'up'])
+        assert raised.value.code == 4 and len(answers) == 1
+        with pytest.raises(SystemExit):                 # флаг не передан — как неинтерактивный
+            sbx.main(['--elevated-for', 'S-1-5-21-1', 'up'])
+        assert len(answers) == 1
         monkeypatch.setattr(sbx.sys, 'stdin', type('Stdin', (), {'isatty': staticmethod(lambda: False)})())
         with pytest.raises(SystemExit):
-            sbx.main(['--elevated-for', 'S-1-5-21-1', 'up'])
+            sbx.main(['--elevated-for', 'S-1-5-21-1', '--elevated-interactive', '1', 'up'])
         assert len(answers) == 1                        # нет консоли — не ждём Enter
     finally:
         sbx.configure_identity(False, {}, False)

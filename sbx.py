@@ -127,6 +127,7 @@ def configure_identity(axiom, env=None, windows=None):
 
 
 NO_ELEVATE = False
+PARENT_INTERACTIVE = False   # повышенный процесс: родитель был интерактивным (скрытый флаг --elevated-interactive)
 configure_identity(axiom_mode())
 UNIT_DIR = Path("/etc/systemd/system")
 # gvisor, а не system/mixed: system-стек принимает TCP через input ядра с TUN-интерфейса,
@@ -410,8 +411,13 @@ def override_arguments(absolute=False):
 
 
 def elevated_arguments():
-    """Скрытые флаги повышенного процесса: UAC не передаёт окружение, поэтому пути идут аргументами."""
-    return ["--elevated-for", windows_user_sid(), *override_arguments()]
+    """Скрытые флаги повышенного процесса: UAC не передаёт окружение, поэтому пути идут аргументами.
+
+    Интерактивность родителя (stdin и stdout — терминал) передаётся явно: у дочернего процесса своя новая
+    консоль, и по ней он не узнает, ждёт ли родитель человека или скрипт.
+    """
+    return ["--elevated-for", windows_user_sid(), "--elevated-interactive", "1" if interactive() else "0",
+            *override_arguments()]
 
 
 def wait_exit_code(handle, wait, exit_code, win_error):
@@ -1279,6 +1285,15 @@ def profile_group(text):
     return {tag: index for index, tag in enumerate(group)} if group else None
 
 
+def group_by_rank(group):
+    """{тег: ранг} -> теги по возрастанию действующего ранга (для кэша) или None.
+
+    У повторяющегося тега ранг — последний индекс, поэтому [A, B, A] даёт B, A; после перезагрузки из
+    кэша порядок остаётся тем же, что без кэша.
+    """
+    return sorted(group, key=group.get) if group else None
+
+
 def drift_date(timestamp):
     try:
         return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -1435,7 +1450,7 @@ def write_axiom_profile(app, *, name=None, url=None, local=None, current=None):
                 if counters:
                     db.execute(f"UPDATE profile_entries SET {', '.join(key + ' = ?' for key in counters)} WHERE id = ?",
                                (*counters.values(), profile_id))
-                write_app_cache(app, profile_id, config, list(profile_group(body) or []) or None,
+                write_app_cache(app, profile_id, config, group_by_rank(profile_group(body)),
                                 row["last_update"])
             else:
                 fields["name"] = unique_profile_name(db, fields["name"], profile_id)
@@ -1602,8 +1617,8 @@ def all_servers(st):
     for sub in st["subs"]:
         for s in load_sub_cache(sub["name"])["servers"]:
             add(s["name"], s["outbound"], sub["name"])
-    for s in st["manual"]:
-        add(s["name"], s["outbound"], "manual")
+    for index, s in enumerate(st["manual"]):
+        add(s["name"], s["outbound"], "manual", manual_index=index)
     return out
 
 
@@ -2124,32 +2139,44 @@ def task_call(action, name=None, *args, check=True, capture=True):
     return run(["schtasks", f"/{action}", "/tn", name or BASE, *args], check=check, capture_output=capture)
 
 
-def task_running(name=None):
+TASK_STOPPED = {"ready", "disabled", "queued"}
+
+
+def task_state(name=None):
+    """Состояние задачи Планировщика: "running" | "stopped" | "unknown" (запрос не удался или ответ не разобран)."""
     name = name or BASE
     result = task_call("query", name, "/fo", "csv", "/nh", check=False)
     if result.returncode:
-        return False
+        return "unknown"
     row = next((r for r in csv.reader(result.stdout.splitlines()) if r), [])
     if row and row[-1].lower() == "running":
-        return True
-    if not row or row[-1].lower() in {"ready", "disabled", "queued"}:
-        return False
+        return "running"
+    if row and row[-1].lower() in TASK_STOPPED:
+        return "stopped"
+    # статус schtasks локализован — спрашиваем числовое состояние (1 Disabled, 2 Queued, 3 Ready, 4 Running)
     result = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                   f"[int](Get-ScheduledTask -TaskName '{name}' -TaskPath '\\').State"],
                  check=False, capture_output=True)
-    return result.returncode == 0 and result.stdout.strip() == "4"
+    value = result.stdout.strip() if result.returncode == 0 else ""
+    return {"4": "running", "1": "stopped", "2": "stopped", "3": "stopped"}.get(value, "unknown")
+
+
+def task_running(name=None):
+    """Работает ли задача; «неизвестно» здесь — False, поэтому для удаления и защиты нужен task_state."""
+    return task_state(name) == "running"
 
 
 def task_listed(name):
-    """Есть ли задача: False — её нет, OSError — Планировщик не ответил (это не «нет задачи»)."""
-    result = task_call("query", None, "/fo", "csv", "/nh", check=False)
+    """Есть ли задача: False — её нет, OSError — Планировщик не ответил (это не «нет задачи»).
+
+    Перечень берётся без /tn: запрос конкретной задачи не отличает «нет» от сбоя и не находит чужое имя.
+    """
+    result = run(["schtasks", "/query", "/fo", "csv", "/nh"], check=False, capture_output=True)
     if result.returncode:
         raise OSError(f"schtasks /query завершился с кодом {result.returncode}: "
                       f"{(result.stderr or result.stdout or '').strip()}")
     wanted = "\\" + name.lower()
-    if any(row and row[0].lower() == wanted for row in csv.reader(result.stdout.splitlines())):
-        return True
-    return task_definition(name) is not None   # перестраховка от иного формата списка
+    return any(row and row[0].lower() == wanted for row in csv.reader(result.stdout.splitlines()))
 
 
 def task_definition(name):
@@ -2293,8 +2320,7 @@ def install_windows_tasks(st, quiet=False):
     publish_windows_config(st)
     if task_definition(BASE) is None:
         register_windows_service(False)
-    if task_definition(UPDATE) is None:
-        register_windows_updater()
+    update_windows_updater()
 
 
 def windows_user_sid():
@@ -2302,11 +2328,36 @@ def windows_user_sid():
     return next(row for row in rows if row)[-1]
 
 
-def register_windows_updater():
+def updater_command():
     args = ["sub", "update", "-q"] if axiom_mode() else ["update", "-q"]
     # задача запускается без окружения установщика: пути, с которыми её зарегистрировали, пишем в командную строку
-    argv = launch_command([*override_arguments(absolute=True), *args])
-    register_task(UPDATE, task_xml(argv, windows_user_sid()))
+    return launch_command([*override_arguments(absolute=True), *args])
+
+
+def register_windows_updater():
+    register_task(UPDATE, task_xml(updater_command(), windows_user_sid()))
+
+
+def registered_action(root):
+    """-> (программа, аргументы) действия зарегистрированной задачи; пробелы по краям значения не важны."""
+    namespace = {"t": TASK_NS}
+    return tuple((root.findtext(f"t:Actions/t:Exec/t:{part}", "", namespace) or "").strip()
+                 for part in ("Command", "Arguments"))
+
+
+def update_windows_updater():
+    """Задача обновления подписок: нет — создать; действие устарело (иные пути, программа) — перерегистрировать."""
+    root = task_definition(UPDATE)
+    if root is None:
+        register_windows_updater()
+        return
+    command = updater_command()
+    if registered_action(root) == (command[0].strip(), subprocess.list2cmdline(command[1:]).strip()):
+        return
+    was_disabled = task_enabled(UPDATE) == "disabled"
+    register_windows_updater()
+    if was_disabled:   # перерегистрация не должна включить то, что пользователь выключил (`sbx disable --timer`)
+        task_call("change", UPDATE, "/disable", capture=False)
 
 
 def prepare_service(st):
@@ -2445,35 +2496,45 @@ def cmd_add(st, a):
 
 
 def cmd_rm(st, a):
-    tag = resolve(st, a.server, allow_auto=False)
-    before = len(st["manual"])
-    st["manual"] = [s for s in st["manual"] if s["name"] != tag]
-    if len(st["manual"]) == before:
-        die(f"{tag} пришёл из подписки — удаляется только вместе с ней (или auto_exclude)")
+    server = resolve_server(st, a.server, allow_auto=False)
+    index = server.get("manual_index")
+    if index is None:
+        die(f"{server['tag']} пришёл из подписки — удаляется только вместе с ней (или auto_exclude)")
+    del st["manual"][index]   # именно запись под этим номером, а не однофамилец по имени
     save_state(st)
     apply(st)
-    print(f"✓ удалён {tag}")
+    print(f"✓ удалён {server['tag']}")
 
 
-def resolve(st, query, allow_auto=True):
-    servers = all_servers(st)
+def resolve_server(st, query, allow_auto=True, hidden_exact=False):
+    """Номер, имя или часть имени -> запись сервера из all_servers (или "auto").
+
+    Номера — как в `ls` (меню AxiOm, потом свои). hidden_exact: точное имя ищется и среди серверов,
+    скрытых из меню (исходящие приложения AxiOm), — нужно правилам via.
+    """
     if allow_auto and query.lower() in {"auto", "0"}:
         return "auto"
-    servers = numbered_servers(st, servers)
+    everything = all_servers(st)
+    servers = numbered_servers(st, everything)
     if query.isdigit():
         i = int(query)
         if 1 <= i <= len(servers):
-            return servers[i - 1]["tag"]
+            return servers[i - 1]
         die(f"номера {i} нет, всего {len(servers)}")
-    exact = [s["tag"] for s in servers if s["tag"] == query]
+    exact = [s for s in (everything if hidden_exact else servers) if s["tag"] == query]
     if exact:
         return exact[0]
-    found = [s["tag"] for s in servers if query.lower() in s["tag"].lower()]
+    found = [s for s in servers if query.lower() in s["tag"].lower()]
     if len(found) == 1:
         return found[0]
     if not found:
         die(f"не найден сервер «{query}» (sbx ls)")
-    die("под «%s» подходят несколько:\n  %s" % (query, "\n  ".join(found)))
+    die("под «%s» подходят несколько:\n  %s" % (query, "\n  ".join(s["tag"] for s in found)))
+
+
+def resolve(st, query, allow_auto=True, hidden_exact=False):
+    server = resolve_server(st, query, allow_auto, hidden_exact)
+    return server if server == "auto" else server["tag"]
 
 
 def cmd_ls(st, a):
@@ -2983,33 +3044,98 @@ def free_port():
         return s.getsockname()[1]
 
 
+RUN_CONFIG = re.compile(r'(?:^|\s)-c\s+(?:"([^"]+)"|(\S+))')
+
+
+def run_config_path(command):
+    """Путь конфига из командной строки `… run -c ПУТЬ …` (ExecStart юнита, Arguments задачи) или None."""
+    match = RUN_CONFIG.search(command or "")
+    return Path(match[1] or match[2]) if match else None
+
+
+def listeners_of(config):
+    """Конфиг sing-box -> (есть ли TUN, {роль настройки: порт}); роли — имена настроек sbx: mixed_port, api_port."""
+    inbounds = [i for i in config.get("inbounds", []) if isinstance(i, dict)]
+    tun = any(i.get("type") == "tun" for i in inbounds)
+    ports = {}
+    for inbound in inbounds:
+        if inbound.get("type") in {"mixed", "socks", "http"} and isinstance(inbound.get("listen_port"), int):
+            ports.setdefault("mixed_port", inbound["listen_port"])
+    controller = ((config.get("experimental") or {}).get("clash_api") or {}).get("external_controller")
+    if isinstance(controller, str) and controller.rpartition(":")[2].isdigit():
+        ports["api_port"] = int(controller.rpartition(":")[2])
+    return tun, ports
+
+
+def installed_runtime_command(unit_name, task_name):
+    """Командная строка, которую служба/задача сейчас реально запускает (из установленного юнита или задачи)."""
+    if IS_WIN:
+        root = task_definition(task_name)
+        if root is None:
+            return None
+        namespace = {"t": TASK_NS}
+        return root.findtext("t:Actions/t:Exec/t:Arguments", None, namespace)
+    for line in (UNIT_DIR / unit_name).read_text(encoding="utf-8").splitlines():
+        if line.startswith("ExecStart="):
+            return line.partition("=")[2]
+    return None
+
+
 def other_brand_active():
-    """-> (имя, режим) другой марки (sbx <-> AxiOm), если её служба или задача сейчас работает, иначе None."""
+    """Другая марка (sbx <-> AxiOm), если её служба/задача работает или это не удалось выяснить, иначе None.
+
+    -> {"name", "tun": True|False|None, "listeners": {настройка: порт}}; tun None — установленный
+    конфиг не прочитался (считаем конфликтом).
+    """
     other_axiom = BASE != "axiom"
     names = identity_names(other_axiom)
     if IS_WIN:
-        active = task_running(names["base"])
+        try:
+            state = task_state(names["base"]) if task_listed(names["base"]) else "stopped"
+        except OSError:
+            state = "unknown"
+        active = state != "stopped"
     else:
         r = systemctl("show", "-p", "ActiveState", "--value", names["unit"], check=False, capture=True)
-        active = r.stdout.strip() == "active"
+        if getattr(r, "returncode", 0):
+            active = True
+        else:
+            active = r.stdout.strip() in {"active", "activating", "reloading"}
     if not active:
         return None
-    mode = "tun"   # состояние не прочиталось — считаем худшее
+    tun, listeners = None, {}
     try:
-        conf = platform_paths(HOME, os.environ, IS_WIN, other_axiom)[0]
-        mode = json.loads((conf / "state.json").read_text(encoding="utf-8"))["settings"]["mode"]
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return names["base"], mode
+        path = run_config_path(installed_runtime_command(names["unit"], names["base"]))
+        if path is not None:
+            tun, listeners = listeners_of(json.loads(path.read_text(encoding="utf-8-sig")))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, ET.ParseError):
+        tun, listeners = None, {}
+    return {"name": names["base"], "tun": tun, "listeners": listeners}
+
+
+def brand_conflict(st, other):
+    """Почему эту марку нельзя запускать рядом с работающей другой (строка), либо None."""
+    name = other["name"]
+    if other["tun"] is None:
+        return (f"работает {name}, но его установленный конфиг не прочитан — режим и порты неизвестны; "
+                f"считаем это конфликтом")
+    settings = st["settings"]
+    if other["tun"] or settings["mode"] == "tun":
+        return (f"работает {name} ({'TUN' if other['tun'] else 'прокси'}): "
+                f"{BASE} и {name} используют те же адреса и маршруты TUN")
+    for key in ("mixed_port", "api_port"):
+        for their_key, port in other["listeners"].items():
+            if settings[key] == port:
+                return (f"порт {port} занят: {BASE} {key} = {port} совпадает с {name} {their_key} = {port}; "
+                        f"смените его (`{BASE} set {key} N`)")
+    return None
 
 
 def refuse_other_brand(st, force):
-    """TUN двух марок (sbx и AxiOm) делят адреса и авто-маршруты: вместе не включаем без --force."""
+    """Обе марки (sbx и AxiOm) вместе не включаем: TUN делят адреса и маршруты, а прокси — порты; обход — --force."""
     other = other_brand_active()
-    if other and not force and "tun" in (st["settings"]["mode"], other[1]):
-        die(f"работает {other[0]} ({'TUN' if other[1] == 'tun' else 'прокси'}): "
-            f"{BASE} и {other[0]} используют те же адреса и маршруты TUN.\n"
-            f"Сначала выключите его ({other[0]} down) или запустите с --force")
+    if other and not force and (reason := brand_conflict(st, other)):
+        die(f"{reason}.\nСначала выключите его ({other['name']} down) или запустите с --force")
 
 
 def cmd_up(st, a):
@@ -3043,7 +3169,9 @@ def cmd_down(st, a):
 
 
 def cmd_restart(st, a):
-    if not require_windows_admin():
+    force = getattr(a, "force", False)
+    refuse_other_brand(st, force)   # restart запускает и остановленную службу
+    if not require_windows_admin(["restart", *(["--force"] if force else [])]):
         return
     prepare_service(st)
     service_action("restart")
@@ -3314,7 +3442,7 @@ def parse_via_target(st, q):
         if not any(re.search(q[3:], s["tag"], re.I) for s in all_servers(st)):
             die(f"под /{q[3:]}/ не подходит ни один сервер (sbx ls)")
         return q
-    return resolve(st, q)
+    return resolve(st, q, hidden_exact=True)
 
 
 def drop_items(s, items):
@@ -3400,16 +3528,22 @@ def cmd_uninstall(st, a):
             except OSError as e:
                 failures.append(f"запрос задачи {name} ({e})")
                 continue
-            if task_running(name):
+            state = task_state(name)
+            if state == "unknown":   # не удалять то, что, возможно, ещё работает
+                failures.append(f"состояние задачи {name} неизвестно (задача оставлена)")
+                continue
+            if state == "running":
                 if task_call("end", name, check=False).returncode:
                     failures.append(f"остановка задачи {name}")
                     continue
                 for _ in range(20):
-                    if not task_running(name):
+                    state = task_state(name)
+                    if state != "running":
                         break
                     time.sleep(0.25)
-                else:
-                    failures.append(f"задача {name} не остановилась")
+                if state != "stopped":
+                    failures.append(f"задача {name} не остановилась" if state == "running" else
+                                    f"остановка задачи {name} не подтверждена (задача оставлена)")
                     continue
             attempt(f"удаление задачи {name}", ["schtasks", "/delete", "/tn", name, "/f"])
         if failures:
@@ -3504,11 +3638,13 @@ def cmd_import(st, a):
 
 
 def cmd_connect(st, a):
+    force = getattr(a, "force", False)
+    refuse_other_brand(st, force)   # раньше выбора: отказ не должен менять сохранённый выбор
     if a.number is not None:
         cmd_use(st, argparse.Namespace(server=str(a.number)))
     elif interactive() and cmd_pick(st, a) is None:
         return
-    cmd_up(st, argparse.Namespace(force=False))
+    cmd_up(st, argparse.Namespace(force=force))
 
 
 def update_arguments(parser, *, self_update=False):
@@ -3523,9 +3659,10 @@ def update_arguments(parser, *, self_update=False):
 
 def take_elevated_prefix(argv):
     """Скрытые флаги повышенного запуска (только после --elevated-for) -> (повышенный ли запуск, остаток argv)."""
+    global PARENT_INTERACTIVE
     argv = list(argv)
     flags, branded = {}, False
-    while argv and (argv[0] in ELEVATED_ENV or argv[0] == "--elevated-for" or argv[0] == "--axiom"):
+    while argv and (argv[0] in ELEVATED_ENV or argv[0] in {"--elevated-for", "--elevated-interactive", "--axiom"}):
         flag = argv.pop(0)
         if flag == "--axiom":
             branded = True
@@ -3533,6 +3670,9 @@ def take_elevated_prefix(argv):
         if not argv:
             die(f"{flag} требует значение")
         flags[flag] = argv.pop(0)
+    PARENT_INTERACTIVE = flags.get("--elevated-interactive") == "1" and "--elevated-for" in flags
+    if "--elevated-interactive" in flags and "--elevated-for" not in flags:
+        die("--elevated-interactive допустим только вместе с --elevated-for")
     if "--elevated-for" in flags:
         if not IS_WIN or not windows_admin() or windows_user_sid() != flags["--elevated-for"]:
             die("UAC требует повышение прав той же учётной записи Windows")
@@ -3550,8 +3690,8 @@ def take_elevated_prefix(argv):
 
 def pause_on_failure(code):
     """Повышенный процесс живёт в своём окне: при ошибке оставить его открытым, пока не нажмут Enter."""
-    if not code or sys.stdin is None or not sys.stdin.isatty():
-        return
+    if not code or not PARENT_INTERACTIVE or sys.stdin is None or not sys.stdin.isatty():
+        return   # родитель без человека (скрипт, CI) ждёт код выхода — окно не задерживаем
     print(f"\nОшибка (код {code}). Нажмите Enter, чтобы закрыть окно…", file=sys.stderr, flush=True)
     try:
         input()
@@ -3619,6 +3759,7 @@ def run_cli(argv):
     x.set_defaults(func=cmd_import)
     x = sp.add_parser("connect", help="выбрать сервер и подключиться; 0 — авто")
     x.add_argument("number", nargs="?", type=int)
+    x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
     x.set_defaults(func=cmd_connect)
 
     x = sp.add_parser("core", help="установка ядра sing-box (Windows)")
@@ -3668,7 +3809,9 @@ def run_cli(argv):
     x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
     x.set_defaults(func=cmd_up)
     sp.add_parser("down", aliases=["disconnect"], help="выключить VPN").set_defaults(func=cmd_down)
-    sp.add_parser("restart", help="перезапустить").set_defaults(func=cmd_restart)
+    x = sp.add_parser("restart", help="перезапустить")
+    x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
+    x.set_defaults(func=cmd_restart)
     sp.add_parser("status", help="состояние").set_defaults(func=cmd_status)
     sp.add_parser("ip", help="внешний IP через VPN").set_defaults(func=cmd_ip)
     x = sp.add_parser("probe", help="проверить ядро, TUN и подписку без перехвата трафика")

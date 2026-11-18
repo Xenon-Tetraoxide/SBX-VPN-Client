@@ -25,3 +25,4 @@ def isolated_identity(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(sbx, 'WORK_DIR', root / 'work')
     monkeypatch.setattr(sbx, 'AXIOM_DB_TIMEOUT', 0.05)
     monkeypatch.setattr(sbx, 'NO_ELEVATE', False)
+    monkeypatch.setattr(sbx, 'PARENT_INTERACTIVE', False)

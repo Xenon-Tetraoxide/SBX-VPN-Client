@@ -70,12 +70,27 @@ jobs:
           python axiom.py up
           Start-Sleep -Seconds 8
           python axiom.py status
-          python sbx.py up; if ($LASTEXITCODE -eq 0) { throw 'sbx up must refuse while axiom runs' }
-          python axiom.py down
+          # cross-brand guard: refusal must come from the guard itself, and axiom must keep running
+          foreach ($command in @('up', 'restart', 'connect 0')) {
+            $text = (python sbx.py $command.Split(' ') 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0) { throw "sbx $command must refuse while axiom runs" }
+            if ($text -notmatch 'работает axiom \(TUN\)') { throw "sbx $command refused for another reason: $text" }
+            if ((schtasks /query /tn axiom /fo csv /nh | Out-String) -notmatch 'Running') { throw "axiom task stopped after sbx $command" }
+            if (-not (Get-Process sing-box -ErrorAction SilentlyContinue)) { throw "axiom sing-box gone after sbx $command" }
+          }
+          # uninstall while it runs: stop, confirm, delete (updater too)
           python axiom.py uninstall
           schtasks /query /tn axiom; if ($LASTEXITCODE -eq 0) { throw 'axiom task still present' }
+          schtasks /query /tn axiom-update; if ($LASTEXITCODE -eq 0) { throw 'axiom updater still present' }
           schtasks /query /tn sbx; if ($LASTEXITCODE -ne 0) { throw 'axiom uninstall removed sbx task' }
+          if (Get-Process sing-box -ErrorAction SilentlyContinue) { throw 'sing-box still running after axiom uninstall' }
           if (-not (Test-Path "$env:APPDATA\AxiOm\cli")) { throw 'axiom config dir missing' }
+          # updater-only install and a second uninstall
+          python axiom.py install
+          schtasks /delete /tn axiom /f
+          python axiom.py uninstall
+          schtasks /query /tn axiom-update; if ($LASTEXITCODE -eq 0) { throw 'updater-only uninstall left the updater' }
+          python axiom.py uninstall
           exit 0
       - name: uninstall
         if: always()
