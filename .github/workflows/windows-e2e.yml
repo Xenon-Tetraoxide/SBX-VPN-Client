@@ -70,6 +70,7 @@ jobs:
           python axiom.py up
           Start-Sleep -Seconds 8
           python axiom.py status
+          python sbx.py up; if ($LASTEXITCODE -eq 0) { throw 'sbx up must refuse while axiom runs' }
           python axiom.py down
           python axiom.py uninstall
           schtasks /query /tn axiom; if ($LASTEXITCODE -eq 0) { throw 'axiom task still present' }

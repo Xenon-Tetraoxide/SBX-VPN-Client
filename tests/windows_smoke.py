@@ -18,6 +18,9 @@ def main():
     results = [key for key, _ in sbx.axiom_sorted(sbx.axiom_options(servers))]
     assert results == [('France', 'hysteria2', 'hy2'), ('Netherlands', 'vless', 'ws')], results
     print(f'Классификация AxiOm: {results}', flush=True)
+    numbered = [server['tag'] for server in sbx.numbered_servers(state, servers)]
+    assert numbered[:2] == [tag for _, tag in sbx.axiom_sorted(sbx.axiom_options(servers))], numbered
+    assert numbered[2:] == [server['tag'] for server in servers if server['tag'] not in numbered[:2]], numbered
     sbx.WORK_DIR.mkdir(parents=True, exist_ok=True)
     for tun in (True, False):
         config = sbx.build_config(state, servers, tun=tun)
