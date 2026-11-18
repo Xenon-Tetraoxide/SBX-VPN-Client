@@ -1,0 +1,199 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns-remote",
+        "server": "1.1.1.1",
+        "path": "/dns-query"
+      },
+      {
+        "type": "udp",
+        "tag": "dns-direct",
+        "server": "77.88.8.8"
+      },
+      {
+        "type": "https",
+        "tag": "dns-via-1",
+        "server": "1.1.1.1",
+        "path": "/dns-query",
+        "detour": "via: ^Germany"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          "local.example"
+        ],
+        "server": "dns-direct"
+      },
+      {
+        "domain_suffix": [
+          "proxy.example"
+        ],
+        "server": "dns-remote"
+      },
+      {
+        "domain_suffix": [
+          "video.example"
+        ],
+        "server": "dns-via-1"
+      }
+    ],
+    "final": "dns-remote",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "sbx0",
+      "address": [
+        "198.18.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "gvisor",
+      "route_exclude_address": [
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "255.255.255.255/32",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8"
+      ]
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": [
+        "auto",
+        "Germany (Arco) [tcp]",
+        "France (Arco) [hy2]"
+      ],
+      "default": "Germany (Arco) [tcp]",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": [
+        "Germany (Arco) [tcp]"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 50
+    },
+    {
+      "type": "urltest",
+      "tag": "via: ^Germany",
+      "outbounds": [
+        "Germany (Arco) [tcp]"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 50
+    },
+    {
+      "type": "vless",
+      "server": "de.example",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "tag": "Germany (Arco) [tcp]"
+    },
+    {
+      "type": "hysteria2",
+      "server": "fr.example",
+      "server_port": 443,
+      "password": "fixture",
+      "tls": {
+        "enabled": true,
+        "server_name": "fr.example"
+      },
+      "tag": "France (Arco) [hy2]"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "protocol": "dns"
+          },
+          {
+            "port": 53
+          }
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "ip_cidr": [
+          "77.88.8.8/32"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "local.example"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "proxy.example"
+        ],
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "video.example"
+        ],
+        "outbound": "via: ^Germany"
+      }
+    ],
+    "rule_set": [],
+    "final": "proxy",
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "dns-direct"
+    }
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9097",
+      "secret": "fixture-secret",
+      "default_mode": "rule"
+    }
+  }
+}

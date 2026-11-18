@@ -1,0 +1,72 @@
+name: Release SBX
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.9', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tests
+
+  windows-smoke:
+    uses: ./.github/workflows/windows-smoke.yml
+
+  windows-exe:
+    needs: [tests, windows-smoke]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - run: python -m pip install 'pyinstaller>=6.10,<7' PyYAML
+      - run: python -m PyInstaller --noconfirm --onefile --console --name sbx-windows-amd64 sbx.py
+      - run: |
+          $version = & .\dist\sbx-windows-amd64.exe --version
+          if ($LASTEXITCODE -ne 0 -or $version -ne ('sbx ' + $env:GITHUB_REF_NAME.Substring(1))) {
+            throw "Версия файла ($version) не совпадает с тегом $env:GITHUB_REF_NAME"
+          }
+          Copy-Item .\dist\sbx-windows-amd64.exe .\dist\axiom.exe
+          $brand = & .\dist\axiom.exe version
+          if ($LASTEXITCODE -ne 0 -or $brand -ne ($version -replace '^sbx ', 'axiom ')) {
+            throw "Режим AxiOm не активировался: $brand"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbx-windows-amd64
+          path: dist/sbx-windows-amd64.exe
+          if-no-files-found: error
+
+  publish:
+    needs: windows-exe
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbx-windows-amd64
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" sbx.py sbx-windows-amd64.exe --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" sbx.py sbx-windows-amd64.exe --verify-tag --generate-notes
+          fi

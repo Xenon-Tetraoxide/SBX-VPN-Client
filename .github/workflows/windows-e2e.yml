@@ -1,0 +1,99 @@
+name: Windows e2e
+
+# Полный цикл на настоящем Windows (раннер — администратор, UAC не спрашивает):
+# ядро, задача Планировщика, TUN, status, down, uninstall, проверка самообновления.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - sbx.py
+      - '.github/workflows/windows-e2e.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      SBX_NO_UPDATE_CHECK: '1'
+      PYTHONUTF8: '1'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: core install
+        run: python sbx.py core install
+      - name: add server and check config
+        run: |
+          python sbx.py add "socks://127.0.0.1:1080#e2e"
+          python sbx.py ls
+          python sbx.py config
+      - name: install task
+        run: |
+          python sbx.py install
+          schtasks /query /tn sbx /v /fo list
+      - name: up
+        run: |
+          python sbx.py up
+          Start-Sleep -Seconds 8
+          python sbx.py status
+          Get-NetAdapter | Format-Table Name, InterfaceDescription, Status
+          if (-not (Get-NetAdapter | Where-Object { $_.Name -like '*sbx*' -or $_.InterfaceDescription -like '*sbx*' -or $_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*Wintun*' })) { throw 'TUN adapter not found' }
+          Get-Process sing-box
+      - name: log
+        if: always()
+        run: python sbx.py log -n 40
+      - name: down
+        run: |
+          python sbx.py down
+          Start-Sleep -Seconds 3
+          python sbx.py status
+          if (Get-Process sing-box -ErrorAction SilentlyContinue) { throw 'sing-box still running' }
+      - name: self-update check
+        run: python sbx.py self-update --check
+      - name: axiom mode
+        run: |
+          Copy-Item sbx.py axiom.py
+          python axiom.py version
+          python axiom.py guide
+      - name: axiom mode e2e (own tasks and dirs)
+        run: |
+          python axiom.py core install
+          python axiom.py add "socks://127.0.0.1:1080#e2e"
+          python axiom.py install
+          schtasks /query /tn axiom /fo list
+          schtasks /query /tn sbx /fo list
+          python axiom.py up
+          Start-Sleep -Seconds 8
+          python axiom.py status
+          # cross-brand guard: refusal must come from the guard itself, and axiom must keep running
+          foreach ($command in @('up', 'restart', 'connect 0')) {
+            $text = (python sbx.py $command.Split(' ') 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0) { throw "sbx $command must refuse while axiom runs" }
+            if ($text -notmatch 'работает axiom \(TUN\)') { throw "sbx $command refused for another reason: $text" }
+            if ((schtasks /query /tn axiom /fo csv /nh | Out-String) -notmatch 'Running') { throw "axiom task stopped after sbx $command" }
+            if (-not (Get-Process sing-box -ErrorAction SilentlyContinue)) { throw "axiom sing-box gone after sbx $command" }
+          }
+          # uninstall while it runs: stop, confirm, delete (updater too)
+          python axiom.py uninstall
+          schtasks /query /tn axiom; if ($LASTEXITCODE -eq 0) { throw 'axiom task still present' }
+          schtasks /query /tn axiom-update; if ($LASTEXITCODE -eq 0) { throw 'axiom updater still present' }
+          schtasks /query /tn sbx; if ($LASTEXITCODE -ne 0) { throw 'axiom uninstall removed sbx task' }
+          if (Get-Process sing-box -ErrorAction SilentlyContinue) { throw 'sing-box still running after axiom uninstall' }
+          if (-not (Test-Path "$env:APPDATA\AxiOm\cli")) { throw 'axiom config dir missing' }
+          # updater-only install and a second uninstall
+          python axiom.py install
+          schtasks /delete /tn axiom /f
+          python axiom.py uninstall
+          schtasks /query /tn axiom-update; if ($LASTEXITCODE -eq 0) { throw 'updater-only uninstall left the updater' }
+          python axiom.py uninstall
+          exit 0
+      - name: uninstall
+        if: always()
+        run: |
+          python sbx.py uninstall
+          schtasks /query /tn sbx; if ($LASTEXITCODE -eq 0) { throw 'task still present' } else { exit 0 }
