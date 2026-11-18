@@ -56,7 +56,7 @@ def test_systemctl_and_units_skip_sudo_for_root(monkeypatch):
     monkeypatch.setattr(sbx, 'is_root', lambda: True)
     sbx.systemctl('daemon-reload', sudo=True)
     sbx.sudo_write(Path('/etc/x'), 'text')
-    assert calls == [['systemctl', 'daemon-reload'], ['tee', '/etc/x']]
+    assert calls == [['systemctl', 'daemon-reload'], ['tee', str(Path('/etc/x'))]]
     monkeypatch.setattr(sbx, 'is_root', lambda: False)
     assert sbx.sudo_cmd('ls') == ['sudo', 'ls']
 
