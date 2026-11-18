@@ -36,6 +36,7 @@
 import argparse
 import base64
 import csv
+import errno
 import hashlib
 import ipaddress
 import json
@@ -1921,6 +1922,12 @@ def app_engine_connected(sync=None):
     return state if state and state["connected"] else None
 
 
+class SyncLockError(OSError):
+    """Замок нельзя ни взять, ни понять, занят ли он (не «занят другим»): запуск без резерва запрещён."""
+
+
+LOCK_HELD_ERRNOS = {errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", errno.EAGAIN),
+                    getattr(errno, "EDEADLOCK", errno.EAGAIN)}
 _HELD = {}                      # путь -> открытый fd: замки POSIX по-процессные, потоки различаем сами
 _HELD_MUTEX = threading.Lock()
 
@@ -1934,7 +1941,10 @@ def try_lock(path):
     with _HELD_MUTEX:
         if key in _HELD:
             return None
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+        except OSError as e:
+            raise SyncLockError(f"не открыть файл замка {path}: {e}") from e
         try:
             if sys.platform == "win32":
                 import msvcrt
@@ -1943,9 +1953,11 @@ def try_lock(path):
             else:
                 import fcntl
                 fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0, os.SEEK_SET)
-        except OSError:
+        except OSError as e:
             os.close(fd)
-            return None
+            if e.errno in LOCK_HELD_ERRNOS:
+                return None
+            raise SyncLockError(f"не взять замок {path}: {e}") from e
         _HELD[key] = fd
         return key
 
@@ -1966,11 +1978,11 @@ def unlock(handle):
 
 
 def lock_held_by_other(path):
-    """Занят ли замок кем-то ещё (проба: взять и сразу отпустить; свой замок этого процесса тоже «занят»)."""
-    try:
-        handle = try_lock(path)
-    except OSError:
-        return False
+    """Занят ли замок кем-то ещё (проба: взять и сразу отпустить; свой замок этого процесса тоже «занят»).
+
+    Ошибка замка (не «занят») — SyncLockError: запуск при неизвестном состоянии не разрешается.
+    """
+    handle = try_lock(path)
     if handle is None:
         return True
     unlock(handle)
@@ -1982,15 +1994,22 @@ def app_state_on(sync):
     return state if state and (state["connected"] or state["connecting"]) else None
 
 
-def app_vpn_on(sync=None, ignore_lock=False):
+def app_vpn_on(sync=None, ignore_lock=False, strict=True):
     """Приложение включено, подключается (connecting) или держит start.lock -> словарь, иначе None."""
     sync = sync_dir() if sync is None else sync
     if sync is None:
         return None
     if state := app_state_on(sync):
         return state
-    if not ignore_lock and sync.is_dir() and lock_held_by_other(sync / "start.lock"):
-        return {"connected": False, "connecting": True, "selection": None, "rawTag": None}
+    if not ignore_lock and sync.is_dir():
+        try:
+            held = lock_held_by_other(sync / "start.lock")
+        except SyncLockError:
+            if strict:
+                raise
+            held = False       # для status: показать как есть, не падать
+        if held:
+            return {"connected": False, "connecting": True, "selection": None, "rawTag": None}
     return None
 
 
@@ -2013,15 +2032,11 @@ def start_reservation(sync):
         yield True
         return
     handle = None
-    try:
-        for attempt in range(START_LOCK_POLL):
-            handle = try_lock(sync / "start.lock")
-            if handle or attempt == START_LOCK_POLL - 1:
-                break
-            time.sleep(0.1)
-    except OSError:
-        yield True      # замок недоступен (права) — без резерва
-        return
+    for attempt in range(START_LOCK_POLL):      # SyncLockError (не «занят») уходит наверх: без резерва не стартуем
+        handle = try_lock(sync / "start.lock")
+        if handle or attempt == START_LOCK_POLL - 1:
+            break
+        time.sleep(0.1)
     if handle is None:
         yield False
         return
@@ -2047,6 +2062,34 @@ def control_lock(sync):
         yield
     finally:
         unlock(handle)
+
+
+def read_intent(sync):
+    data = read_sync_json(sync / "vpn-intent.json") if sync else None
+    if (data and is_v1(data.get("v")) and data.get("want") in ("on", "off") and is_uuid4(data.get("id"))
+            and is_int(data.get("ts")) and data.get("by") in ("app", "cli")):
+        return data
+    return None
+
+
+def write_intent(sync, want, by="cli"):
+    """vpn-intent.json: последнее намерение пользователя (последний писатель побеждает); ts строго растёт."""
+    if not sync or not sync.is_dir():
+        return None
+    previous = read_intent(sync)
+    now = int(time.time() * 1000)
+    intent = {"v": 1, "want": want, "id": str(uuid.uuid4()), "ts": max(now, previous["ts"] + 1 if previous else 0),
+              "by": by}
+    write_private(sync / "vpn-intent.json", json.dumps(intent))
+    return intent
+
+
+def intent_cancelled(sync, mine):
+    """Появилось более новое намерение (в т. ч. OFF) после нашего ON — запуск надо отменить."""
+    if not mine:
+        return False
+    current = read_intent(sync)
+    return bool(current and current["id"] != mine["id"] and current["ts"] > mine["ts"])
 
 
 def write_control(sync, cmd, selection=None):
@@ -3656,8 +3699,45 @@ APP_ON_MESSAGE = "VPN уже включён в приложении AxiOm"
 APP_STARTING_MESSAGE = "VPN запускается другой стороной (приложение AxiOm) — свой движок не запускаю"
 
 
+CANCELLED_MESSAGE = "запуск отменён: после включения пришло более новое намерение (выключение)"
+
+
+def coordinated_start(st, sync, mine, action, *, wait_ready):
+    """Запуск своего движка: подготовка (сеть) -> замок -> перепроверки -> старт. False — не запущен."""
+    prepare_service(st)           # вся сеть (наборы правил, подписки) и конфиг — до замка запуска
+    if intent_cancelled(sync, mine):
+        print(CANCELLED_MESSAGE)
+        return False
+    with start_reservation(sync) as reserved:
+        if not reserved:
+            print(APP_STARTING_MESSAGE)
+            return False
+        if intent_cancelled(sync, mine):
+            print(CANCELLED_MESSAGE)
+            return False
+        if sync and app_vpn_on(sync, ignore_lock=True):    # пока готовились, приложение могло включиться
+            print(APP_ON_MESSAGE)
+            return False
+        if intent_cancelled(sync, mine):                   # и прямо перед запуском
+            print(CANCELLED_MESSAGE)
+            return False
+        service_action(action)
+        if wait_ready:
+            time.sleep(1.5)
+            if IS_WIN:
+                for _ in range(20):
+                    if is_active(st):
+                        break
+                    time.sleep(0.25)
+            if not is_active(st):
+                cmd_log(st, argparse.Namespace(lines=30, follow=False, replace=False))
+                die("sing-box не запустился")
+    return True
+
+
 def cmd_up(st, a):
     sync = sync_dir()
+    mine = write_intent(sync, "on")
     if sync and app_vpn_on(sync):
         print(APP_ON_MESSAGE)
         return
@@ -3671,30 +3751,16 @@ def cmd_up(st, a):
     if others and not a.force:
         die("работает другой VPN-клиент, маршруты подерутся:\n  " + "\n  ".join(others) +
             "\nзакройте его или запустите с --force")
-    prepare_service(st)           # вся сеть (наборы правил, подписки) и конфиг — до замка запуска
-    with start_reservation(sync) as reserved:
-        if not reserved:
-            print(APP_STARTING_MESSAGE)
-            return
-        if sync and app_vpn_on(sync, ignore_lock=True):    # пока готовились, приложение могло включиться
-            print(APP_ON_MESSAGE)
-            return
-        service_action("restart" if (task_running() if IS_WIN else is_active(st)) else "start")
-        time.sleep(1.5)
-        if IS_WIN:
-            for _ in range(20):
-                if is_active(st):
-                    break
-                time.sleep(0.25)
-        if not is_active(st):
-            cmd_log(st, argparse.Namespace(lines=30, follow=False, replace=False))
-            die("sing-box не запустился")
+    action = "restart" if (task_running() if IS_WIN else is_active(st)) else "start"
+    if not coordinated_start(st, sync, mine, action, wait_ready=True):
+        return
     print("✓ VPN включён")
     show_status(st)
 
 
 def cmd_down(st, a):
     sync = sync_dir()
+    write_intent(sync, "off")                 # сначала намерение: идущий запуск увидит его и отменится
     if sync:
         wait_app_start_finished(sync)         # приложение как раз запускается — дать ему закончить, потом выключить
     app_on = app_vpn_on(sync) if sync else None
@@ -3712,8 +3778,17 @@ def cmd_down(st, a):
 
 def cmd_restart(st, a):
     force = getattr(a, "force", False)
+    sync = sync_dir()
+    mine = write_intent(sync, "on") if BASE == "axiom" else None
+    if BASE == "axiom" and sync and app_vpn_on(sync):
+        print(APP_ON_MESSAGE + " — restart ничего не делает")
+        return
     refuse_other_brand(st, force)   # restart запускает и остановленную службу
     if not require_windows_admin(["restart", *(["--force"] if force else [])]):
+        return
+    if BASE == "axiom":              # тот же порядок, что у up: подготовка, замок, перепроверки
+        if coordinated_start(st, sync, mine, "restart", wait_ready=False):
+            print("✓ перезапущен")
         return
     prepare_service(st)
     service_action("restart")
@@ -3724,7 +3799,7 @@ def show_status(st):
     active = is_active(st)
     enabled = task_enabled(BASE) if IS_WIN else unit_prop("UnitFileState")
     s = st["settings"]
-    app_on = app_vpn_on()
+    app_on = app_vpn_on(strict=False)
     print(f"состояние:   {'работает' if active else 'выключен'}"
           f"  (автозапуск: {'да' if enabled == 'enabled' else 'нет'})")
     if app_on:
@@ -3759,7 +3834,7 @@ def unit_prop_of(unit, prop):
 
 def status_info(st):
     sync = sync_dir()
-    app_on = app_vpn_on(sync) if sync else None
+    app_on = app_vpn_on(sync, strict=False) if sync else None
     cli_on = is_active(st)
     selection = None
     if app_on and isinstance(app_on.get("selection"), dict) and app_on["selection"].get("c"):

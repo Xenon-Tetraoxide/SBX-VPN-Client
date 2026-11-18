@@ -1079,3 +1079,182 @@ def test_app_state_requires_every_field(sync, missing):
     del doc[missing]
     (sync / 'app-state.json').write_text(json.dumps(doc))
     assert sbx.app_state(sync) is None
+
+
+# ══ v4: намерение пользователя, fail-closed, restart ═════════════════════════
+
+def intent(sync):
+    return sbx.read_intent(sync)
+
+
+def test_intent_written_by_up_down_restart_connect(monkeypatch, sync, cli):
+    monkeypatch.setattr(sbx, 'show_status', lambda st: None)
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    first = intent(sync)
+    assert first['want'] == 'on' and first['by'] == 'cli' and sbx.is_uuid4(first['id']) and first['v'] == 1
+    sbx.cmd_down(axiom_state(), argparse.Namespace())
+    off = intent(sync)
+    assert off['want'] == 'off' and off['ts'] > first['ts'] and off['id'] != first['id']
+    sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    assert intent(sync)['want'] == 'on'
+    sbx.cmd_down(axiom_state(), argparse.Namespace())
+    sbx.cmd_connect(axiom_state(), argparse.Namespace(number=None, select='__auto__', force=False))
+    assert intent(sync)['want'] == 'on'
+
+
+def test_intent_ts_strictly_increases(sync):
+    stamps = [sbx.write_intent(sync, 'on' if i % 2 else 'off')['ts'] for i in range(5)]
+    assert stamps == sorted(set(stamps))
+    assert sbx.write_intent(sync / 'missing-dir', 'on') is None             # нет каталога приложения — ничего не пишется
+
+
+@pytest.mark.parametrize('patch', [{'want': 'maybe'}, {'by': 'x'}, {'id': 'nope'}, {'ts': 'now'}, {'v': 2}])
+def test_invalid_intent_ignored(sync, patch):
+    doc = sbx.write_intent(sync, 'off')
+    (sync / 'vpn-intent.json').write_text(json.dumps({**doc, **patch}))
+    assert sbx.read_intent(sync) is None
+
+
+def other_off(sync):
+    return sbx.write_intent(sync, 'off', by='app')
+
+
+def test_off_during_preparation_cancels_up(monkeypatch, sync, cli, capsys):
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(sbx, 'prepare_service', lambda st: other_off(sync))      # OFF пришёл, пока шла подготовка
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == [] and 'отменён' in capsys.readouterr().out
+    assert not sbx.lock_held_by_other(sync / 'start.lock') and intent(sync)['want'] == 'off'
+
+
+def test_off_after_taking_lock_cancels_up(monkeypatch, sync, cli, capsys):
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(sbx, 'write_owner', lambda sync_, owner: other_off(sync))  # OFF сразу после взятия замка
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == [] and 'отменён' in capsys.readouterr().out
+    assert not sbx.lock_held_by_other(sync / 'start.lock')
+
+
+def test_off_right_before_service_start_cancels_up(monkeypatch, sync, cli, capsys):
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    real = sbx.app_vpn_on
+
+    def recheck(sync_=None, ignore_lock=False, strict=True):
+        result = real(sync_, ignore_lock, strict)
+        if ignore_lock:
+            other_off(sync)                                                    # между перепроверкой и стартом
+        return result
+
+    monkeypatch.setattr(sbx, 'app_vpn_on', recheck)
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == [] and 'отменён' in capsys.readouterr().out
+
+
+def test_newer_on_does_not_cancel_own_start_but_older_off_does_not_either(monkeypatch, sync, cli):
+    monkeypatch.setattr(sbx, 'show_status', lambda st: None)
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    other_off(sync)                                                            # старый OFF до нашего ON — не отмена
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == ['start']
+
+
+def test_off_during_preparation_cancels_restart(monkeypatch, sync, cli, capsys):
+    monkeypatch.setattr(sbx, 'prepare_service', lambda st: other_off(sync))
+    sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == [] and 'отменён' in capsys.readouterr().out
+
+
+# ── O: fail-closed ──────────────────────────────────────────────────────────
+
+def test_lock_open_error_refuses_to_start(monkeypatch, sync, cli):
+    real_open = os.open
+
+    def fail(path, *a, **k):
+        if str(path).endswith('start.lock'):
+            raise PermissionError(13, 'нет прав')
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(sbx.os, 'open', fail)
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    with pytest.raises(sbx.SyncLockError):
+        sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == []
+    assert issubclass(sbx.SyncLockError, OSError)                              # run_cli превращает в «sbx: …», код 1
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='fcntl')
+def test_lock_error_vs_held(monkeypatch, sync):
+    import errno
+    import fcntl
+
+    def lockf(fd, cmd, *a):
+        raise OSError(error[0], 'x')
+
+    monkeypatch.setattr(fcntl, 'lockf', lockf)
+    for held in (errno.EACCES, errno.EAGAIN):
+        error = [held]
+        assert sbx.try_lock(sync / 'start.lock') is None                      # «занят» — не ошибка
+    error = [errno.ENOLCK]
+    with pytest.raises(sbx.SyncLockError):
+        sbx.try_lock(sync / 'start.lock')
+    with pytest.raises(sbx.SyncLockError):
+        sbx.lock_held_by_other(sync / 'start.lock')
+    with pytest.raises(sbx.SyncLockError):
+        sbx.app_vpn_on(sync)
+    assert sbx.app_vpn_on(sync, strict=False) is None                          # status не падает
+    assert not sbx._HELD
+
+
+def test_lock_error_exit_code_one(monkeypatch, sync, cli, tmp_path):
+    monkeypatch.setattr(sbx, 'CONF_DIR', tmp_path / 'c')
+    monkeypatch.setattr(sbx, 'STATE_FILE', tmp_path / 'c/state.json')
+    monkeypatch.setattr(sbx, 'SUBS_DIR', tmp_path / 'c/subs')
+    monkeypatch.setattr(sbx.sys, 'argv', ['axiom'])
+
+    def broken(path):
+        raise sbx.SyncLockError('не взять замок')
+
+    monkeypatch.setattr(sbx, 'try_lock', broken)
+    with pytest.raises(SystemExit) as exc:
+        sbx.main(['up'])
+    assert exc.value.code == 1 and cli['service'] == []
+
+
+# ── P: restart ───────────────────────────────────────────────────────────────
+
+def test_restart_noop_when_app_engine_on(sync, cli, capsys):
+    with FakeApp(sync) as app:
+        sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == [] and app.executed == [] and 'restart ничего не делает' in capsys.readouterr().out
+
+
+def test_restart_noop_when_app_connecting_or_starting(sync, cli):
+    with FakeApp(sync, connected=False, connecting=True):
+        sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    with FakeApp(sync, connected=False) as app:
+        app.hold_start_lock()
+        sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == []
+
+
+def test_restart_coordinated_with_lock(monkeypatch, sync, cli):
+    seen = {}
+    monkeypatch.setattr(sbx, 'prepare_service',
+                        lambda st: seen.setdefault('prepare_locked', sbx.lock_held_by_other(sync / 'start.lock')))
+    sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    assert seen['prepare_locked'] is False and cli['service'] == ['restart'] and cli['lock_during'] is True
+    assert not sbx.lock_held_by_other(sync / 'start.lock')
+
+
+def test_restart_recheck_after_lock(monkeypatch, sync, cli, capsys):
+    monkeypatch.setattr(sbx, 'app_vpn_on', lambda sync_=None, ignore_lock=False, strict=True:
+                        {'connected': True, 'connecting': False} if ignore_lock else None)
+    sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == [] and 'VPN уже включён в приложении AxiOm' in capsys.readouterr().out
+
+
+def test_restart_sbx_mode_unchanged(monkeypatch, sync, cli):
+    monkeypatch.setattr(sbx, 'BASE', 'sbx')
+    sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == ['restart'] and not (sync / 'vpn-intent.json').exists()
