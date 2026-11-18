@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -110,11 +111,12 @@ class FakeApp:
             'connected': self.connected, 'connecting': self.connecting,
             'selection': dict(zip('cpt', self.selection)), 'rawTag': self.raw_tag if self.connected else None})
 
-    def hold_start_lock(self, age_ms=0):
-        self.write('start.lock', {'owner': 'app', 'id': str(uuid.uuid4()), 'ts': now_ms() - age_ms})
+    def hold_start_lock(self):
+        self.start_handle = sbx.try_lock(self.sync / 'start.lock')
+        assert self.start_handle
 
     def release_start_lock(self):
-        (self.sync / 'start.lock').unlink(missing_ok=True)
+        sbx.unlock(self.start_handle)
 
     def loop(self):
         while not self.stop.is_set():
@@ -154,6 +156,9 @@ class FakeApp:
     def __exit__(self, *exc):
         self.stop.set()
         self.thread.join()
+        if getattr(self, 'start_handle', None):
+            sbx.unlock(self.start_handle)
+            self.start_handle = None
 
 
 # ── обнаружение и состояние ────────────────────────────────────────────────
@@ -172,7 +177,8 @@ def test_sync_dir_discovery(monkeypatch, tmp_path, app_dir):
 
 def test_app_state_staleness_and_garbage(sync):
     path = sync / 'app-state.json'
-    state = {'v': 1, 'heartbeat': now_ms(), 'connected': True}
+    state = {'v': 1, 'pid': 1, 'heartbeat': now_ms(), 'connected': True, 'connecting': False,
+             'selection': {'c': '__auto__', 'p': '', 't': ''}}
     path.write_text(json.dumps(state))
     assert sbx.app_engine_connected(sync)['connected'] is True
     path.write_text(json.dumps({**state, 'heartbeat': now_ms() - 10_500}))
@@ -595,7 +601,7 @@ def test_cli_writes_prefs_when_app_not_running(app_dir, sync, cli):
 def test_select_sent_with_app_idle(sync, cli):
     with FakeApp(sync, connected=False) as app:                    # приложение запущено, VPN выключен
         sbx.cmd_use(axiom_state(), argparse.Namespace(server=None, select='France||'))
-    assert app.executed[0]['selection'] == {'c': 'France', 'p': 'hysteria2', 't': 'hy2'}
+    assert app.executed[0]['selection'] == {'c': 'France', 'p': '', 't': ''}    # приложение разбирает само
     assert cli['service'] == [] and cli['api'] == []
 
 
@@ -635,22 +641,13 @@ def test_select_ok_with_no_own_servers(monkeypatch, sync, cli, capsys):
         sbx.cmd_use(axiom_state(), argparse.Namespace(server='1'))
 
 
-def test_unparsable_start_lock_counts_as_held(sync):
+def test_start_lock_is_os_lock_not_file_content(sync):
     lock = sync / 'start.lock'
-    for content in ('', '{half', '[]'):
-        lock.write_text(content)
-        assert sbx.start_lock_fresh(sbx.read_start_lock(sync))
-        assert sbx.app_vpn_on(sync) is not None
-        with sbx.start_reservation(sync) as mine:
-            assert mine is False
-        assert lock.exists()                                        # чужой пустой лок не снят
-    old = time.time() - 61
-    os.utime(lock, (old, old))                                      # возраст по mtime: старше 60 с — брошен
-    assert not sbx.start_lock_fresh(sbx.read_start_lock(sync))
+    lock.write_text('{half')                            # содержимое ничего не значит — только замок ядра
     assert sbx.app_vpn_on(sync) is None
     with sbx.start_reservation(sync) as mine:
         assert mine is True
-
+    assert lock.exists()                                # файлы замков не удаляются
 
 def test_select_resolved_against_app_menu_without_cli_servers(sync, cli):
     with FakeApp(sync) as app:
@@ -660,33 +657,29 @@ def test_select_resolved_against_app_menu_without_cli_servers(sync, cli):
 
 # ── 3: start.lock ────────────────────────────────────────────────────────
 
-def test_cli_start_holds_and_removes_lock(monkeypatch, sync, cli):
+def test_cli_start_holds_and_releases_lock(monkeypatch, sync, cli):
     monkeypatch.setattr(sbx, 'show_status', lambda st: None)
     monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
     sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
-    assert cli['service'] == ['start'] and cli['lock_during'] is True      # лок был во время запуска
-    assert not (sync / 'start.lock').exists()                               # и снят после
+    assert cli['service'] == ['start'] and cli['lock_during'] is True      # замок был во время запуска
+    assert not sbx.lock_held_by_other(sync / 'start.lock')                  # и отпущен после
+    assert (sync / 'start.lock').exists() and json.loads((sync / 'start.owner.json').read_text())['owner'] == 'cli'
 
-
-def test_lock_removed_when_start_fails(monkeypatch, sync, cli):
+def test_lock_released_when_start_fails(monkeypatch, sync, cli):
     monkeypatch.setattr(sbx, 'cmd_log', lambda *a: None)
     monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
     monkeypatch.setattr(sbx, 'service_action', lambda action: None)        # движок не поднялся
     with pytest.raises(SystemExit):
         sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
-    assert not (sync / 'start.lock').exists()
+    assert not sbx.lock_held_by_other(sync / 'start.lock')
 
-
-def test_lock_payload_and_exclusive(sync):
+def test_start_reservation_exclusive_in_process(sync):
     with sbx.start_reservation(sync) as mine:
         assert mine is True
-        data = json.loads((sync / 'start.lock').read_text())
-        assert data['owner'] == 'cli' and is_uuid(data['id']) and abs(data['ts'] - now_ms()) < 5000
         with sbx.start_reservation(sync) as second:
             assert second is False                                          # второй стартер не получает резерв
-        assert (sync / 'start.lock').exists()
-    assert not (sync / 'start.lock').exists()
-
+        assert sbx.lock_held_by_other(sync / 'start.lock')
+    assert not sbx.lock_held_by_other(sync / 'start.lock')
 
 def is_uuid(value):
     return sbx.is_uuid4(value)
@@ -707,24 +700,39 @@ def test_app_connecting_means_on(sync, cli, capsys):
     assert 'уже включён' in out and '"vpn": "on"' in out and cli['service'] == []
 
 
-def test_stale_app_lock_ignored(monkeypatch, sync, cli):
+def test_released_app_lock_allows_start(monkeypatch, sync, cli):
     monkeypatch.setattr(sbx, 'show_status', lambda st: None)
     monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
     with FakeApp(sync, connected=False) as app:
-        app.hold_start_lock(age_ms=61_000)
+        app.hold_start_lock()
+        app.release_start_lock()
         sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
     assert cli['service'] == ['start']
 
+def test_recheck_after_acquire_aborts_start(monkeypatch, sync, cli, capsys):
+    """Приложение включилось, пока CLI готовился: после взятия замка повторная проверка отменяет запуск (B)."""
+    calls = []
 
-def test_cli_does_not_start_when_lock_taken_midway(monkeypatch, sync, cli, capsys):
-    """Приложение успело взять лок после проверки app_vpn_on: CLI свой движок не запускает."""
-    real = sbx.app_vpn_on
-    monkeypatch.setattr(sbx, 'app_vpn_on', lambda sync=None: None)
-    (sync / 'start.lock').write_text(json.dumps({'owner': 'app', 'id': str(uuid.uuid4()), 'ts': now_ms()}))
+    def app_vpn_on(sync=None, ignore_lock=False):
+        calls.append(ignore_lock)
+        return {'connected': True, 'connecting': False} if ignore_lock else None
+
+    monkeypatch.setattr(sbx, 'app_vpn_on', app_vpn_on)
     sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
-    assert cli['service'] == [] and 'запускается' in capsys.readouterr().out
-    assert real is not None
+    assert calls == [False, True]
+    assert cli['service'] == [] and 'VPN уже включён в приложении AxiOm' in capsys.readouterr().out
+    assert not sbx.lock_held_by_other(sync / 'start.lock')              # замок отпущен
 
+
+def test_network_work_outside_start_lock(monkeypatch, sync, cli):
+    """Подготовка (наборы правил, подписки, конфиг) — до замка; под замком только запуск и проверка готовности (C)."""
+    seen = {}
+    monkeypatch.setattr(sbx, 'show_status', lambda st: None)
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(sbx, 'prepare_service',
+                        lambda st: seen.setdefault('prepare_locked', sbx.lock_held_by_other(sync / 'start.lock')))
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert seen['prepare_locked'] is False and cli['lock_during'] is True
 
 def test_down_waits_for_app_start(sync, cli):
     with FakeApp(sync, connected=False, connecting=True) as app:
@@ -751,7 +759,7 @@ def test_control_lock_held_until_ack(sync):
 
     def slow_ack():
         time.sleep(0.2)
-        seen.append((sync / 'control.lock').exists())
+        seen.append(sbx.lock_held_by_other(sync / 'control.lock'))
         command = json.loads((sync / 'control.json').read_text())
         (sync / 'control-ack.json').write_text(json.dumps({'v': 1, 'id': command['id'], 'ok': True, 'ts': now_ms()}))
 
@@ -759,24 +767,15 @@ def test_control_lock_held_until_ack(sync):
     thread.start()
     sbx.send_app_command(sync, 'disconnect')
     thread.join()
-    assert seen == [True] and not (sync / 'control.lock').exists()
-
+    assert seen == [True] and not sbx.lock_held_by_other(sync / 'control.lock')
 
 def test_control_lock_released_on_timeout(sync, monkeypatch):
     monkeypatch.setattr(sbx, 'SYNC_ACK_TIMEOUT', 0.2)
     with pytest.raises(SystemExit):
         sbx.send_app_command(sync, 'disconnect')
-    assert not (sync / 'control.lock').exists()
+    assert not sbx.lock_held_by_other(sync / 'control.lock')
 
-
-def test_control_lock_stale_removed_and_serializes(sync):
-    lock = sync / 'control.lock'
-    lock.write_text(json.dumps({'owner': 'cli', 'id': 'x', 'ts': 1}))
-    old = time.time() - 60
-    os.utime(lock, (old, old))
-    with sbx.control_lock(sync):
-        assert lock.exists()
-    assert not lock.exists()
+def test_control_lock_serializes_threads(sync):
     order = []
     with FakeApp(sync, delay=0.15) as app:
         def sender(tag):
@@ -789,7 +788,75 @@ def test_control_lock_stale_removed_and_serializes(sync):
         for t in threads:
             t.join()
     assert len(app.executed) == 2 and len(order) == 2                    # обе команды дошли, ни одна не затёрта
+    assert (sync / 'control.lock').exists()                              # файл замка не удаляется
 
+
+# ── настоящие процессы: замки ядра, гибель держателя ────────────────────────
+
+HOLDER = """
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import sbx
+handle = sbx.try_lock(sys.argv[2])
+print('locked' if handle else 'busy', flush=True)
+if handle:
+    time.sleep(60)
+"""
+
+
+def spawn_holder(path):
+    proc = subprocess.Popen([sys.executable, '-c', HOLDER, str(Path(sbx.__file__).parent), str(path)],
+                            stdout=subprocess.PIPE, text=True)
+    return proc, proc.stdout.readline().strip()
+
+
+@pytest.mark.parametrize('name', ['start.lock', 'control.lock'])
+def test_two_processes_contend_for_lock(sync, name):
+    path = sync / name
+    first, status = spawn_holder(path)
+    try:
+        assert status == 'locked'
+        assert sbx.lock_held_by_other(path)                                # другой процесс держит
+        assert sbx.try_lock(path) is None
+        second, status2 = spawn_holder(path)                               # и второй процесс не получает
+        assert status2 == 'busy'
+        second.wait(timeout=10)
+    finally:
+        first.kill()
+        first.wait()
+    deadline = time.time() + 5
+    while sbx.lock_held_by_other(path) and time.time() < deadline:
+        time.sleep(0.05)
+    handle = sbx.try_lock(path)                                            # убитый (kill -9) держатель отпустил замок
+    assert handle is not None
+    sbx.unlock(handle)
+    assert path.exists()
+
+
+def test_cli_start_refused_while_other_process_starts(sync, cli, capsys):
+    first, status = spawn_holder(sync / 'start.lock')
+    try:
+        assert status == 'locked'
+        sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+        assert 'VPN уже включён в приложении AxiOm' in capsys.readouterr().out and cli['service'] == []
+    finally:
+        first.kill()
+        first.wait()
+
+
+def test_control_lock_waits_for_other_process(sync, monkeypatch):
+    monkeypatch.setattr(sbx, 'CONTROL_LOCK_WAIT', 0.3)
+    first, status = spawn_holder(sync / 'control.lock')
+    try:
+        assert status == 'locked'
+        with pytest.raises(SystemExit):
+            with sbx.control_lock(sync):
+                pass
+    finally:
+        first.kill()
+        first.wait()
+    with sbx.control_lock(sync):                                           # после гибели держателя — свободно
+        pass
 
 def test_fake_app_durable_dedup(sync):
     command_id = sbx.write_control(sync, 'disconnect')
@@ -803,9 +870,9 @@ def test_fake_app_durable_dedup(sync):
 
 @pytest.mark.parametrize('patch', [{'v': 2}, {'v': True}, {'heartbeat': True}, {'heartbeat': '1'},
                                    {'connected': 'true'}, {'connected': 1}, {'connecting': 'no'},
-                                   {'selection': {'c': 1, 'p': '', 't': ''}}, {'selection': 'x'}])
+                                   {'selection': {'c': 1, 'p': '', 't': ''}}, {'selection': 'x'}, {'pid': '1'}, {'pid': True}])
 def test_invalid_app_state_rejected(sync, patch):
-    doc = {'v': 1, 'heartbeat': now_ms(), 'connected': True, 'connecting': False,
+    doc = {'v': 1, 'pid': 1, 'heartbeat': now_ms(), 'connected': True, 'connecting': False,
            'selection': {'c': '__auto__', 'p': '', 't': ''}}
     (sync / 'app-state.json').write_text(json.dumps(doc))
     assert sbx.app_state(sync) is not None
@@ -982,3 +1049,33 @@ def test_pending_fetch_persists_until_success(monkeypatch, old_cli_dir):
     saved = json.loads((old_cli_dir / 'state.json').read_text())
     assert 'pending_fetch' not in saved
     assert json.loads((old_cli_dir / 'subs/axiom.json').read_text())['servers'][0]['name'] == 'France (x) [hy2]'
+
+
+# ── G: приложение само разбирает тройку; I: все поля app-state обязательны ──
+
+def test_select_triple_sent_as_given_when_unknown_to_cli(monkeypatch, sync, cli, capsys):
+    monkeypatch.setattr(sbx, 'all_servers', lambda st: [])            # у CLI своего меню нет
+    with FakeApp(sync) as app:
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server=None, select='Mars|vless|ws'))
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server=None, select='__auto__|x|y'))
+    assert [c['selection'] for c in app.executed] == [{'c': 'Mars', 'p': 'vless', 't': 'ws'},
+                                                      {'c': '__auto__', 'p': '', 't': ''}]
+    assert 'передан приложению' in capsys.readouterr().out
+    with pytest.raises(SystemExit):                                    # только синтаксис проверяется локально
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server=None, select='|a|b'))
+
+
+def test_app_rejects_unknown_triple(monkeypatch, sync, cli, capsys):
+    with FakeApp(sync, ok=False):
+        with pytest.raises(SystemExit) as exc:
+            sbx.cmd_use(axiom_state(), argparse.Namespace(server=None, select='Mars|vless|ws'))
+    assert exc.value.code == 1 and 'boom' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('missing', ['v', 'pid', 'heartbeat', 'connected', 'connecting', 'selection'])
+def test_app_state_requires_every_field(sync, missing):
+    doc = {'v': 1, 'pid': 1, 'heartbeat': now_ms(), 'connected': True, 'connecting': False,
+           'selection': {'c': '__auto__', 'p': '', 't': ''}}
+    del doc[missing]
+    (sync / 'app-state.json').write_text(json.dumps(doc))
+    assert sbx.app_state(sync) is None

@@ -51,6 +51,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1863,10 +1864,9 @@ def axiom_write_selection(app, choice):
 SYNC_STALE_MS = 10_000      # сердцебиение app-state.json старше — приложение не запущено
 SYNC_ACK_TIMEOUT = 15.0     # сколько ждать control-ack.json
 SYNC_POLL = 0.2
-START_LOCK_TTL_MS = 60_000  # start.lock моложе — идёт запуск движка
-CONTROL_LOCK_TTL = 30.0     # control.lock старше — считается брошенным
-CONTROL_LOCK_WAIT = 20.0
-START_WAIT = 30.0           # сколько ждать чужого запуска перед отключением
+CONTROL_LOCK_WAIT = 20.0    # сколько ждать чужую команду к приложению
+START_LOCK_POLL = 5         # попыток (по 0.1 с) взять start.lock: чужая проба держит его мгновение
+START_WAIT = 60.0           # сколько ждать чужого запуска перед отключением
 
 
 def sync_dir():
@@ -1896,12 +1896,13 @@ def is_uuid4(value):
 
 
 def valid_app_state(data):
-    if not data or not is_v1(data.get("v")) or not is_int(data.get("heartbeat")) or not isinstance(data.get("connected"), bool):
+    """Все поля обязательны и с верными типами, иначе файл считается отсутствующим."""
+    if not data or not is_v1(data.get("v")) or not is_int(data.get("pid")) or not is_int(data.get("heartbeat")):
         return False
-    if "connecting" in data and not isinstance(data["connecting"], bool):
+    if not isinstance(data.get("connected"), bool) or not isinstance(data.get("connecting"), bool):
         return False
     selection = data.get("selection")
-    return selection is None or (isinstance(selection, dict) and all(isinstance(selection.get(k), str) for k in "cpt"))
+    return isinstance(selection, dict) and all(isinstance(selection.get(k), str) for k in "cpt")
 
 
 def app_state(sync=None):
@@ -1920,102 +1921,132 @@ def app_engine_connected(sync=None):
     return state if state and state["connected"] else None
 
 
-def read_start_lock(sync):
-    path = sync / "start.lock"
-    data = read_sync_json(path)
-    if data and data.get("owner") in ("app", "cli") and isinstance(data.get("id"), str) and is_int(data.get("ts")):
-        return data
-    try:       # файл есть, но пуст/не разобран (создаётся эксклюзивно, содержимое пишется вторым шагом): занят, возраст по mtime
-        return {"owner": "unknown", "id": "", "ts": int(path.stat().st_mtime * 1000)}
+_HELD = {}                      # путь -> открытый fd: замки POSIX по-процессные, потоки различаем сами
+_HELD_MUTEX = threading.Lock()
+
+
+def try_lock(path):
+    """Неблокирующий эксклюзивный замок на байт 0 постоянного файла (файл не удаляется): fcntl.lockf / msvcrt.locking.
+
+    Замок снимает ядро при гибели процесса — устаревших замков нет. -> дескриптор или None (занят другим).
+    """
+    key = str(path)
+    with _HELD_MUTEX:
+        if key in _HELD:
+            return None
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0, os.SEEK_SET)
+        except OSError:
+            os.close(fd)
+            return None
+        _HELD[key] = fd
+        return key
+
+
+def unlock(handle):
+    with _HELD_MUTEX:
+        fd = _HELD.pop(handle, None)
+        if fd is None:
+            return
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def lock_held_by_other(path):
+    """Занят ли замок кем-то ещё (проба: взять и сразу отпустить; свой замок этого процесса тоже «занят»)."""
+    try:
+        handle = try_lock(path)
     except OSError:
-        return None
+        return False
+    if handle is None:
+        return True
+    unlock(handle)
+    return False
 
 
-def start_lock_fresh(lock):
-    return bool(lock) and abs(time.time() * 1000 - lock["ts"]) < START_LOCK_TTL_MS
+def app_state_on(sync):
+    state = app_state(sync)
+    return state if state and (state["connected"] or state["connecting"]) else None
 
 
-def app_vpn_on(sync=None):
-    """Приложение включено, подключается (connecting) или держит свежий start.lock -> словарь, иначе None."""
+def app_vpn_on(sync=None, ignore_lock=False):
+    """Приложение включено, подключается (connecting) или держит start.lock -> словарь, иначе None."""
     sync = sync_dir() if sync is None else sync
     if sync is None:
         return None
-    state = app_state(sync)
-    if state and (state["connected"] or state.get("connecting")):
+    if state := app_state_on(sync):
         return state
-    lock = read_start_lock(sync)
-    if lock and lock["owner"] != "cli" and start_lock_fresh(lock):
+    if not ignore_lock and sync.is_dir() and lock_held_by_other(sync / "start.lock"):
         return {"connected": False, "connecting": True, "selection": None, "rawTag": None}
     return None
 
 
-def create_exclusive(path, payload):
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload))
-
-
-def lock_payload(owner):
-    return {"owner": owner, "id": str(uuid.uuid4()), "ts": int(time.time() * 1000)}
+def write_owner(sync, owner):
+    """start.owner.json — только для сообщений; best-effort."""
+    try:
+        write_private(sync / "start.owner.json", json.dumps(
+            {"owner": owner, "id": str(uuid.uuid4()), "ts": int(time.time() * 1000)}))
+    except OSError:
+        pass
 
 
 @contextmanager
 def start_reservation(sync):
-    """Резерв запуска движка: start.lock создаётся эксклюзивно, снимается, когда движок поднят или запуск сорвался.
+    """Резерв запуска движка: замок start.lock, пока идёт запуск и проверка готовности (сеть — до него).
 
-    Выдаёт True, если резерв наш (или каталога синхронизации нет); False — запуск уже идёт у другой стороны.
+    Выдаёт True, если резерв наш (или синхронизации нет); False — запуск уже идёт у другой стороны.
     """
     if sync is None or not sync.is_dir():
         yield True
         return
-    path, payload = sync / "start.lock", lock_payload("cli")
-    for _ in range(3):
-        try:
-            create_exclusive(path, payload)
-            break
-        except FileExistsError:
-            lock = read_start_lock(sync)
-            if start_lock_fresh(lock):
-                yield False
-                return
-            path.unlink(missing_ok=True)     # брошенный или битый
-    else:
+    handle = None
+    try:
+        for attempt in range(START_LOCK_POLL):
+            handle = try_lock(sync / "start.lock")
+            if handle or attempt == START_LOCK_POLL - 1:
+                break
+            time.sleep(0.1)
+    except OSError:
+        yield True      # замок недоступен (права) — без резерва
+        return
+    if handle is None:
         yield False
         return
     try:
+        write_owner(sync, "cli")
         yield True
     finally:
-        held = read_start_lock(sync)
-        if held and held["id"] == payload["id"]:
-            path.unlink(missing_ok=True)
+        unlock(handle)
 
 
 @contextmanager
 def control_lock(sync):
     """control.lock держится от записи control.json до ack или таймаута: две команды CLI не затирают друг друга."""
-    path, payload = sync / "control.lock", lock_payload("cli")
     deadline = time.monotonic() + CONTROL_LOCK_WAIT
     while True:
-        try:
-            create_exclusive(path, payload)
+        handle = try_lock(sync / "control.lock")
+        if handle:
             break
-        except FileExistsError:
-            try:
-                age = time.time() - path.stat().st_mtime
-            except OSError:
-                age = 0
-            if age > CONTROL_LOCK_TTL:
-                path.unlink(missing_ok=True)
-                continue
-            if time.monotonic() >= deadline:
-                die("другая команда sbx уже обращается к приложению AxiOm; повторите позже")
-            time.sleep(SYNC_POLL)
+        if time.monotonic() >= deadline:
+            die("другая команда sbx уже обращается к приложению AxiOm; повторите позже")
+        time.sleep(SYNC_POLL)
     try:
         yield
     finally:
-        held = read_sync_json(path)
-        if held and held.get("id") == payload["id"]:
-            path.unlink(missing_ok=True)
+        unlock(handle)
 
 
 def write_control(sync, cmd, selection=None):
@@ -2061,12 +2092,11 @@ def send_app_command(sync, cmd, selection=None):
 
 
 def wait_app_start_finished(sync):
-    """OFF при чужом запуске: ждёт (до 30 с), пока приложение закончит запуск."""
+    """OFF при чужом запуске: ждёт (до 60 с), пока приложение закончит запуск."""
     deadline = time.monotonic() + START_WAIT
     while time.monotonic() < deadline:
         state = app_state(sync)
-        lock = read_start_lock(sync)
-        starting = (state and state.get("connecting")) or (lock and lock["owner"] != "cli" and start_lock_fresh(lock))
+        starting = (state and state["connecting"]) or (sync.is_dir() and lock_held_by_other(sync / "start.lock"))
         if not starting:
             return
         time.sleep(SYNC_POLL)
@@ -2081,35 +2111,38 @@ def parse_select(text):
     return tuple(part.strip() for part in parts)
 
 
-def resolve_select(st, text):
-    """--select "C|P|T" -> (каноническая тройка приложения, тег сервера или "auto").
-
-    __auto__ -> авто, p/t игнорируются; пустой p — первый протокол страны, пустой t — первый транспорт (c,p)
-    в порядке приложения. Не из текущего меню — ошибка.
-    """
-    if not st.get("_axiom") or not st["_axiom"].get("root"):
-        die("--select работает только в режиме AxiOm при найденном приложении")
-    country, protocol, transport = parse_select(text)
+def select_lookup(st, triple):
+    """Тройка -> ((ключ меню, тег), None) или (None, текст ошибки): по меню CLI; пустые p/t — первые."""
+    country, protocol, transport = triple
     if country == AXIOM_AUTO:
-        return (AXIOM_AUTO, "", ""), "auto"
+        return ((AXIOM_AUTO, "", ""), "auto"), None
     options = axiom_sorted(axiom_options(all_servers(st)))
     found = [(key, tag) for key, tag in options if key[0] == country]
     if not found:
-        die(f"--select: страны «{country}» нет в меню; доступны: "
-            + ", ".join(dict.fromkeys(key[0] for key, _ in options)))
+        return None, (f"--select: страны «{country}» нет в меню; доступны: "
+                      + ", ".join(dict.fromkeys(key[0] for key, _ in options)))
     if protocol:
         found = [(key, tag) for key, tag in found if key[1] == protocol]
         if not found:
-            die(f"--select: у «{country}» нет протокола «{protocol}»")
+            return None, f"--select: у «{country}» нет протокола «{protocol}»"
     else:
         found = [(key, tag) for key, tag in found if key[1] == found[0][0][1]]
     chosen_protocol = found[0][0][1]
     if transport:
         found = [(key, tag) for key, tag in found if key[2] == transport]
         if not found:
-            die(f"--select: у «{country}|{chosen_protocol}» нет транспорта «{transport}»")
-    key, tag = found[0]
-    return key, tag
+            return None, f"--select: у «{country}|{chosen_protocol}» нет транспорта «{transport}»"
+    return found[0], None
+
+
+def resolve_select(st, text):
+    """--select "C|P|T" -> (каноническая тройка, тег или "auto"); не из меню CLI — ошибка."""
+    if not st.get("_axiom") or not st["_axiom"].get("root"):
+        die("--select работает только в режиме AxiOm при найденном приложении")
+    found, error = select_lookup(st, parse_select(text))
+    if error:
+        die(error)
+    return found
 
 
 def remember_selection(app, triple):
@@ -3001,13 +3034,24 @@ def cmd_ls(st, a):
 
 def cmd_use(st, a):
     triple = None
-    if getattr(a, "select", None):
-        triple, tag = resolve_select(st, a.select)
-    else:
-        tag = resolve(st, a.server)
     app = st.get("_axiom")
     sync = sync_dir() if app and app.get("root") else None
     app_running = bool(sync and app_state(sync))     # свежее сердцебиение: файл настроек пишет только приложение
+    if getattr(a, "select", None):
+        given = parse_select(a.select)
+        if app_running:
+            # приложение само разбирает и проверяет тройку по своему меню; тут только синтаксис
+            triple = (AXIOM_AUTO, "", "") if given[0] == AXIOM_AUTO else given
+            found, _ = select_lookup(st, given)
+            if found is None:                        # в меню CLI такого нет — выбор целиком за приложением
+                send_app_command(sync, "select", triple)
+                print("✓ выбор передан приложению AxiOm")
+                return
+            key, tag = found
+        else:
+            triple, tag = resolve_select(st, a.select)
+    else:
+        tag = resolve(st, a.server)
     send = False
     if app:
         options, extras = axiom_menu(all_servers(st))
@@ -3627,11 +3671,14 @@ def cmd_up(st, a):
     if others and not a.force:
         die("работает другой VPN-клиент, маршруты подерутся:\n  " + "\n  ".join(others) +
             "\nзакройте его или запустите с --force")
+    prepare_service(st)           # вся сеть (наборы правил, подписки) и конфиг — до замка запуска
     with start_reservation(sync) as reserved:
         if not reserved:
             print(APP_STARTING_MESSAGE)
             return
-        prepare_service(st)
+        if sync and app_vpn_on(sync, ignore_lock=True):    # пока готовились, приложение могло включиться
+            print(APP_ON_MESSAGE)
+            return
         service_action("restart" if (task_running() if IS_WIN else is_active(st)) else "start")
         time.sleep(1.5)
         if IS_WIN:
