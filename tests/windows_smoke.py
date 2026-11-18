@@ -32,7 +32,10 @@ def main():
     cli_env = {**os.environ, 'SBX_BRAND': 'axiom', 'XDG_DATA_HOME': str(sbx.WORK_DIR)}
     result = subprocess.run([sys.executable, 'sbx.py', 'ls'], env=cli_env, check=True,
                             capture_output=True, encoding='utf-8')
-    assert 'France' in result.stdout and 'WebSocket' in result.stdout and 'Germany' not in result.stdout
+    out = result.stdout
+    assert 'France' in out and 'WebSocket' in out, out
+    # [reality] нет в классификации приложения: такой сервер виден только среди своих
+    assert 'Свои серверы' in out and out.index('Germany') > out.index('Свои серверы'), out
     print(result.stdout, end='')
 
 
