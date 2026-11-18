@@ -63,6 +63,7 @@ def test_windows_elevation_dispatch(monkeypatch):
     monkeypatch.setattr(sbx, 'IS_WIN', True)
     monkeypatch.setattr(sbx, 'windows_admin', lambda: False)
     monkeypatch.setattr(sbx, 'request_windows_admin', lambda args: calls.append(args))
+    monkeypatch.setattr(sbx, 'other_brand_active', lambda: None)
     calls = []
     sbx.cmd_up({}, sbx.argparse.Namespace(force=True))
     sbx.cmd_down({}, None)

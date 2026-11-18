@@ -165,7 +165,7 @@ def test_profile_parsing_and_picker(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert 'QUIC' in output and 'HTTP/2 TLS' in output
     assert output.index('Свои серверы') < output.index('Germany')
-    assert sbx.resolve(st, '1', use_axiom=True) == FRANCE
+    assert sbx.resolve(st, '1') == FRANCE
 
 
 def test_profile_largest_group_and_detour(monkeypatch, app_directory):

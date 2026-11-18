@@ -117,31 +117,82 @@ def test_elevated_arguments_forward_environment(monkeypatch):
     monkeypatch.setenv('SBX_AXIOM_HOME', 'C:/a')
     monkeypatch.setenv('SBX_SING_BOX', 'C:/s.exe')
     monkeypatch.setenv('SBX_BRAND', 'axiom')
-    assert sbx.elevated_arguments('L.log') == ['--elevated-for', 'S-1-5-21-1', '--sbx-home', 'C:/h',
-                                               '--axiom-home', 'C:/a', '--sing-box', 'C:/s.exe',
-                                               '--axiom', '--elevated-log', 'L.log']
+    assert sbx.elevated_arguments() == ['--elevated-for', 'S-1-5-21-1', '--sbx-home', 'C:/h',
+                                        '--axiom-home', 'C:/a', '--sing-box', 'C:/s.exe', '--axiom']
 
 
-def test_request_windows_admin_waits_relays_log_and_exits_with_code(monkeypatch, capsys):
+def test_request_windows_admin_runs_visible_child_and_exits_with_its_code(monkeypatch, capsys):
     windows(monkeypatch)
     seen = {}
 
     def runas(exe, params, cwd):
         seen['params'] = params
-        log = params.split('--elevated-log ')[1].split(' ')[0].strip('"')
-        Path(log).write_text('сделано\n', encoding='utf-8')
-        seen['log'] = log
         return 7
 
     monkeypatch.setattr(sbx, 'shell_execute_runas', runas)
     with pytest.raises(SystemExit) as raised:
         sbx.request_windows_admin(['restart'])
     assert raised.value.code == 7
-    assert 'сделано' in capsys.readouterr().out
+    assert '--elevated-log' not in seen['params']   # никакого пути журнала от вызывающего
     assert '--elevated-for S-1-5-21-1' in seen['params'] and seen['params'].endswith('restart')
-    assert not Path(seen['log']).exists()
     monkeypatch.setattr(sbx, 'shell_execute_runas', lambda *a: 0)
     sbx.request_windows_admin(['restart'])
+    assert 'администратора' in capsys.readouterr().out
+
+
+def test_request_windows_admin_reports_win32_failure(monkeypatch, capsys):
+    windows(monkeypatch)
+
+    def runas(*args):
+        raise OSError('[WinError 1223] Операция отменена пользователем')
+
+    monkeypatch.setattr(sbx, 'shell_execute_runas', runas)
+    with pytest.raises(SystemExit) as raised:
+        sbx.request_windows_admin(['up'])
+    assert raised.value.code == 1 and '1223' in capsys.readouterr().err
+
+
+def test_wait_exit_code_checks_every_win32_result():
+    errors = lambda: OSError('winerror')
+    assert sbx.wait_exit_code(5, lambda h: 0, lambda h: (True, 3), errors) == 3
+    with pytest.raises(OSError, match='winerror'):
+        sbx.wait_exit_code(5, lambda h: 0xFFFFFFFF, lambda h: (True, 0), errors)
+    with pytest.raises(OSError, match='0x102'):
+        sbx.wait_exit_code(5, lambda h: 0x102, lambda h: (True, 0), errors)
+    with pytest.raises(OSError, match='winerror'):
+        sbx.wait_exit_code(5, lambda h: 0, lambda h: (False, 0), errors)
+
+
+def test_elevated_child_pauses_only_on_failure_with_a_console(monkeypatch, capsys):
+    windows(monkeypatch)
+    monkeypatch.setattr(sbx, 'windows_admin', lambda: True)
+    monkeypatch.setattr(sbx, 'remove_old_exe', lambda: None)
+    answers = []
+    monkeypatch.setattr('builtins.input', lambda *a: answers.append(1) or '')
+    stdin = type('Stdin', (), {'isatty': staticmethod(lambda: True)})()
+    monkeypatch.setattr(sbx.sys, 'stdin', stdin)
+    outcome = {'code': 3}
+
+    def fake_cli(argv):
+        if outcome['code']:
+            sbx.die('сломалось', outcome['code'])
+
+    monkeypatch.setattr(sbx, 'run_cli', fake_cli)
+    try:
+        with pytest.raises(SystemExit) as raised:
+            sbx.main(['--elevated-for', 'S-1-5-21-1', 'up'])
+        assert raised.value.code == 3 and len(answers) == 1
+        assert 'сломалось' in capsys.readouterr().err
+        outcome['code'] = 0
+        sbx.main(['--elevated-for', 'S-1-5-21-1', 'up'])
+        assert len(answers) == 1                        # успех — без паузы
+        outcome['code'] = 4
+        monkeypatch.setattr(sbx.sys, 'stdin', type('Stdin', (), {'isatty': staticmethod(lambda: False)})())
+        with pytest.raises(SystemExit):
+            sbx.main(['--elevated-for', 'S-1-5-21-1', 'up'])
+        assert len(answers) == 1                        # нет консоли — не ждём Enter
+    finally:
+        sbx.configure_identity(False, {}, False)
 
 
 def test_elevated_prefix_restores_environment(monkeypatch):
@@ -150,16 +201,18 @@ def test_elevated_prefix_restores_environment(monkeypatch):
     monkeypatch.delenv('SBX_HOME', raising=False)
     monkeypatch.delenv('SBX_BRAND', raising=False)
     try:
-        log, rest = sbx.take_elevated_prefix(['--elevated-for', 'S-1-5-21-1', '--sbx-home', '/tmp/h',
-                                              '--axiom', '--elevated-log', 'x.log', 'status'])
-        assert (log, rest) == ('x.log', ['status'])
+        elevated, rest = sbx.take_elevated_prefix(['--elevated-for', 'S-1-5-21-1', '--sbx-home', '/tmp/h',
+                                                   '--axiom', 'status'])
+        assert (elevated, rest) == (True, ['status'])
         assert sbx.os.environ['SBX_HOME'] == '/tmp/h' and sbx.axiom_mode()
     finally:
         sbx.os.environ.pop('SBX_HOME', None)
         sbx.os.environ.pop('SBX_BRAND', None)
         sbx.configure_identity(False, {}, False)
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit):   # привилегированный процесс без --elevated-for
         sbx.take_elevated_prefix(['--sbx-home', '/x', 'status'])
+    with pytest.raises(SystemExit):   # --elevated-log больше не существует
+        sbx.main(['--elevated-for', 'S-1-5-21-1', '--elevated-log', 'x', 'status'])
 
 
 def test_no_elevate_exits_with_2(monkeypatch, capsys):
@@ -310,7 +363,7 @@ def test_own_servers_listed_and_selectable(monkeypatch, app_directory, capsys):
     sbx.cmd_ls(st, argparse.Namespace(filter=None))
     out = capsys.readouterr().out
     assert out.index('Свои серверы') < out.index('Mine')
-    assert sbx.resolve(st, '3', use_axiom=True) == 'Mine'
+    assert sbx.resolve(st, '3') == 'Mine'
     assert 'Mine' in sbx.build_config(st, servers)['outbounds'][1]['outbounds']
     monkeypatch.setattr(sbx, 'apply', lambda *a, **k: None)
     monkeypatch.setattr(sbx, 'is_active', lambda _: False)

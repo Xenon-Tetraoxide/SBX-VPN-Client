@@ -16,6 +16,7 @@ def no_network(monkeypatch):
 def isolated_identity(monkeypatch, tmp_path_factory):
     """Тесты не трогают настоящие ~/.config/sbx и не ждут блокировок базы по 3 с."""
     root = tmp_path_factory.mktemp('sbx-home')
+    monkeypatch.setattr(sbx, 'HOME', root / 'home')   # пересчёт путей никогда не видит настоящий домашний каталог
     monkeypatch.setattr(sbx, 'CONF_DIR', root)
     monkeypatch.setattr(sbx, 'STATE_FILE', root / 'state.json')
     monkeypatch.setattr(sbx, 'SUBS_DIR', root / 'subs')
