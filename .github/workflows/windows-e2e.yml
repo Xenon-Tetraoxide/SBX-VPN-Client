@@ -60,6 +60,22 @@ jobs:
           Copy-Item sbx.py axiom.py
           python axiom.py version
           python axiom.py guide
+      - name: axiom mode e2e (own tasks and dirs)
+        run: |
+          python axiom.py core install
+          python axiom.py add "socks://127.0.0.1:1080#e2e"
+          python axiom.py install
+          schtasks /query /tn axiom /fo list
+          schtasks /query /tn sbx /fo list
+          python axiom.py up
+          Start-Sleep -Seconds 8
+          python axiom.py status
+          python axiom.py down
+          python axiom.py uninstall
+          schtasks /query /tn axiom; if ($LASTEXITCODE -eq 0) { throw 'axiom task still present' }
+          schtasks /query /tn sbx; if ($LASTEXITCODE -ne 0) { throw 'axiom uninstall removed sbx task' }
+          if (-not (Test-Path "$env:APPDATA\AxiOm\cli")) { throw 'axiom config dir missing' }
+          exit 0
       - name: uninstall
         if: always()
         run: |
