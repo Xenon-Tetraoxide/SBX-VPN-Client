@@ -158,12 +158,13 @@ def test_profile_parsing_and_picker(monkeypatch, capsys):
     st['latency'] = {FRANCE: 55, NETHERLANDS: 22, GERMANY: 3}
     cfg = sbx.build_config(st, servers)
     assert cfg['outbounds'][1]['outbounds'][0] == NETHERLANDS
-    assert GERMANY not in cfg['outbounds'][1]['outbounds']
+    assert GERMANY in cfg['outbounds'][1]['outbounds']   # свои серверы не прячутся
     monkeypatch.setattr(sbx, 'all_servers', lambda _: servers)
     monkeypatch.setattr(sbx, 'is_active', lambda _: False)
     sbx.cmd_ls(st, argparse.Namespace(filter=None))
     output = capsys.readouterr().out
-    assert 'QUIC' in output and 'HTTP/2 TLS' in output and 'Germany' not in output
+    assert 'QUIC' in output and 'HTTP/2 TLS' in output
+    assert output.index('Свои серверы') < output.index('Germany')
     assert sbx.resolve(st, '1', use_axiom=True) == FRANCE
 
 

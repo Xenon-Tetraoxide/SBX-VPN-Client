@@ -70,14 +70,30 @@ HOME = Path.home()
 IS_WIN = os.name == "nt"
 
 
-def platform_paths(home, env, windows):
+def axiom_mode(argv0=None):
+    return os.environ.get("SBX_BRAND", "").lower() == "axiom" or axiom_mode_without_env(
+        sys.argv[0] if argv0 is None else argv0)
+
+
+def axiom_mode_without_env(argv0):
+    return re.split(r"[/\\]", str(argv0))[-1].lower() in {"axiom", "axiom.exe", "axiom.py"}
+
+
+def platform_paths(home, env, windows, axiom=False):
+    """-> (каталог настроек, рабочий каталог, каталог ядра). AxiOm живёт отдельно от sbx."""
+    override = env.get("SBX_HOME")
     if windows:
-        app = Path(env.get("APPDATA") or home / "AppData/Roaming") / "sbx"
-        local = Path(env.get("LOCALAPPDATA") or home / "AppData/Local") / "sbx"
-        config = Path(env.get("SBX_HOME") or app)
-        return config, config / "work" if env.get("SBX_HOME") else local / "work", local / "core"
-    config = Path(env.get("SBX_HOME") or home / ".config/sbx")
-    return config, config / "work" if env.get("SBX_HOME") else home / ".local/state/sbx", None
+        roaming = Path(env.get("APPDATA") or home / "AppData/Roaming")
+        local = Path(env.get("LOCALAPPDATA") or home / "AppData/Local")
+        app, local = (roaming / "AxiOm" / "cli", local / "AxiOm" / "cli") if axiom else (
+            roaming / "sbx", local / "sbx")
+        config = Path(override or app)
+        return config, config / "work" if override else local / "work", local / "core"
+    if axiom:
+        config = Path(override or home / ".config/axiom/cli")
+        return config, config / "work" if override else home / ".local/state/axiom", None
+    config = Path(override or home / ".config/sbx")
+    return config, config / "work" if override else home / ".local/state/sbx", None
 
 
 def sing_box_path(env, windows, core):
@@ -85,20 +101,37 @@ def sing_box_path(env, windows, core):
                                        shutil.which("sing-box") or "/usr/bin/sing-box")
 
 
-CONF_DIR, WORK_DIR, CORE_DIR = platform_paths(HOME, os.environ, IS_WIN)
-STATE_FILE = CONF_DIR / "state.json"
-SUBS_DIR = CONF_DIR / "subs"
-RULESET_DIR = CONF_DIR / "rulesets"
-CONFIG_FILE = CONF_DIR / "config.json"
-SING_BOX = sing_box_path(os.environ, IS_WIN, CORE_DIR)
-LOG_FILE = WORK_DIR / "sing-box.log"
-UNIT = "sbx.service"
+def identity_names(axiom):
+    """Имена служб, задач и интерфейсов: у AxiOm свои, чтобы не пересекаться с sbx."""
+    base = "axiom" if axiom else "sbx"
+    return {"base": base, "unit": f"{base}.service", "update": f"{base}-update",
+            "probe": f"{base}-probe", "probe_unit": f"{base}-probe.service",
+            "tun": "axiom0" if axiom else "sbx0"}
+
+
+def configure_identity(axiom, env=None, windows=None):
+    global CONF_DIR, WORK_DIR, CORE_DIR, STATE_FILE, SUBS_DIR, RULESET_DIR, CONFIG_FILE, SING_BOX, LOG_FILE
+    global BASE, UNIT, UPDATE, PROBE_IF, PROBE_UNIT, DEFAULT_TUN
+    env = os.environ if env is None else env
+    windows = IS_WIN if windows is None else windows
+    CONF_DIR, WORK_DIR, CORE_DIR = platform_paths(HOME, env, windows, axiom)
+    STATE_FILE = CONF_DIR / "state.json"
+    SUBS_DIR = CONF_DIR / "subs"
+    RULESET_DIR = CONF_DIR / "rulesets"
+    CONFIG_FILE = CONF_DIR / "config.json"
+    SING_BOX = sing_box_path(env, windows, CORE_DIR)
+    LOG_FILE = WORK_DIR / "sing-box.log"
+    names = identity_names(axiom)
+    BASE, UNIT, UPDATE = names["base"], names["unit"], names["update"]
+    PROBE_IF, PROBE_UNIT, DEFAULT_TUN = names["probe"], names["probe_unit"], names["tun"]
+
+
+NO_ELEVATE = False
+configure_identity(axiom_mode())
 UNIT_DIR = Path("/etc/systemd/system")
-PROBE_IF = "sbx-probe"
 # gvisor, а не system/mixed: system-стек принимает TCP через input ядра с TUN-интерфейса,
 # а nftables (policy drop, разрешены lo/wg0/LAN) такие пакеты режет — TCP не работает.
 STACK = "gvisor"
-PROBE_UNIT = "sbx-probe.service"
 
 PROXY_TYPES = {"vless", "vmess", "trojan", "shadowsocks", "hysteria", "hysteria2",
                "tuic", "socks", "http", "ssh", "shadowtls", "anytls", "naive"}
@@ -168,6 +201,8 @@ def load_state():
         settings = {**st["settings"], **saved.get("settings", {})}
         st.update(saved)
         st["settings"] = settings
+    elif DEFAULT_TUN != st["settings"]["tun_name"]:
+        st["settings"]["tun_name"] = DEFAULT_TUN   # новое состояние AxiOm: свой интерфейс axiom0
     if not st["settings"]["api_secret"]:
         st["settings"]["api_secret"] = secrets.token_hex(16)
     return st
@@ -228,11 +263,23 @@ def b64decode(s):
 
 
 def run(cmd, check=True, **kw):
+    kw.setdefault("errors", "replace")   # вывод schtasks/whoami бывает в OEM-кодовой странице
+    if sys.platform == "win32":
+        kw.setdefault("encoding", "oem")
     return subprocess.run(cmd, check=check, text=True, **kw)
 
 
+def is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def sudo_cmd(*cmd):
+    """Команда с правами root: от root — как есть, иначе через sudo."""
+    return list(cmd) if is_root() else ["sudo", *cmd]
+
+
 def systemctl(*args, sudo=False, check=True, capture=False):
-    cmd = (["sudo"] if sudo and os.geteuid() != 0 else []) + ["systemctl", *args]
+    cmd = sudo_cmd("systemctl", *args) if sudo else ["systemctl", *args]
     return run(cmd, check=check, capture_output=capture)
 
 
@@ -334,21 +381,87 @@ def windows_admin():
     return bool(ctypes.windll.shell32.IsUserAnAdmin())
 
 
-def request_windows_admin(argv):
-    import ctypes
+ELEVATED_ENV = {"--sbx-home": "SBX_HOME", "--axiom-home": "SBX_AXIOM_HOME", "--sing-box": "SBX_SING_BOX"}
+
+
+def elevated_arguments(log_path):
+    """Скрытые флаги повышенного процесса: UAC не передаёт окружение, поэтому пути идут аргументами."""
     args = ["--elevated-for", windows_user_sid()]
+    for flag, key in ELEVATED_ENV.items():
+        if os.environ.get(key):
+            args += [flag, os.environ[key]]
     if axiom_mode():
         args.append("--axiom")
-    exe, *args = launch_command([*args, *argv])
-    execute = ctypes.windll.shell32.ShellExecuteW
-    execute.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
-                        ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
-    execute.restype = ctypes.c_void_p
+    if log_path:
+        args += ["--elevated-log", str(log_path)]
+    return args
+
+
+def shell_execute_runas(exe, params, cwd):
+    """ShellExecuteExW runas: ждёт завершения и возвращает код выхода (Windows, ctypes)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ShellExecuteInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR), ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
+                    ("hIconOrMonitor", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
+
+    shell32, kernel32 = ctypes.windll.shell32, ctypes.windll.kernel32
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(ShellExecuteInfo)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    info = ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x40   # SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb, info.lpFile, info.lpParameters, info.lpDirectory = "runas", exe, params, cwd
+    info.nShow = 0
+    if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+        raise OSError("ShellExecuteExW")
+    try:
+        kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+        code = wintypes.DWORD(1)
+        kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+        return code.value
+    finally:
+        kernel32.CloseHandle(info.hProcess)
+
+
+def relay_elevated_log(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if text:
+        print(text, end="" if text.endswith("\n") else "\n", flush=True)
+
+
+def request_windows_admin(argv):
+    if NO_ELEVATE:
+        warn("нужны права администратора, а запуск с --no-elevate; не выполнено: " + " ".join(map(str, argv)))
+        sys.exit(2)
+    fd, log = tempfile.mkstemp(prefix="sbx-elevated-", suffix=".log")
+    os.close(fd)
+    exe, *args = launch_command([*elevated_arguments(log), *argv])
     if frozen_windows():
         os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-    result = execute(None, "runas", exe, subprocess.list2cmdline(args), str(Path.cwd()), 1)
-    if not result or result <= 32:
-        die("не удалось получить права администратора (UAC)")
+    try:
+        try:
+            code = shell_execute_runas(exe, subprocess.list2cmdline(args), str(Path.cwd()))
+        except OSError:
+            die("не удалось получить права администратора (UAC)")
+        relay_elevated_log(log)
+    finally:
+        Path(log).unlink(missing_ok=True)
+    if code:
+        sys.exit(code)
 
 
 def require_windows_admin(argv=None):
@@ -416,13 +529,13 @@ def replace_update(download, target, executable):
 
 def sudo_replace_update(download, target):
     mode = f"{stat.S_IMODE(target.stat().st_mode):04o}"
-    temp = run(["sudo", "mktemp", "--tmpdir", str(target.parent), ".sbx-update.XXXXXXXX"],
+    temp = run(sudo_cmd("mktemp", "-p", str(target.parent), ".sbx-update.XXXXXXXX"),
                capture_output=True).stdout.strip()
     try:
-        run(["sudo", "install", "-m", mode, "--", str(download), temp])
-        run(["sudo", "mv", "-T", "--", temp, str(target)])
+        run(sudo_cmd("install", "-m", mode, "--", str(download), temp))
+        run(sudo_cmd("mv", "-T", "--", temp, str(target)))
     finally:
-        run(["sudo", "rm", "-f", "--", temp], check=False)
+        run(sudo_cmd("rm", "-f", "--", temp), check=False)
 
 
 def install_update(release):
@@ -468,8 +581,12 @@ def cmd_self_update(st, a):
         die("без терминала укажите --yes для установки или --check для проверки")
 
 
+NO_NOTICE_COMMANDS = {"self-update", "core", "up", "down", "disconnect", "restart", "connect", "status",
+                      "install", "uninstall", "enable", "disable"}
+
+
 def maybe_notice_update(st, a):
-    if (not interactive() or getattr(a, "quiet", False) or a.cmd == "self-update"
+    if (not interactive() or getattr(a, "quiet", False) or a.cmd in NO_NOTICE_COMMANDS
             or os.environ.get("SBX_NO_UPDATE_CHECK") == "1" or os.environ.get("INVOCATION_ID")):
         return
     try:
@@ -917,20 +1034,16 @@ def update_subs(st, names=None, quiet=False):
 
 AXIOM_UA_VERSION = "4.6.1"
 AXIOM_DB_VERSION = 5
+AXIOM_DB_TIMEOUT = 3.0
+
+
+class AxiomDBUnavailable(ValueError):
+    """База приложения AxiOm не годится для записи (версия схемы, недоступна)."""
 AXIOM_HEADERS = {"profile-title", "content-disposition", "subscription-userinfo", "profile-update-interval",
                  "support-url", "profile-web-page-url", "enable-warp", "enable-fragment"}
 AXIOM_PREFS = ("server_selector_country", "server_selector_protocol", "server_selector_transport")
 AXIOM_AUTO = "__auto__"
 AXIOM_FILE = "shared_preferences.json"
-
-
-def axiom_mode(argv0=None):
-    return os.environ.get("SBX_BRAND", "").lower() == "axiom" or axiom_mode_without_env(
-        sys.argv[0] if argv0 is None else argv0)
-
-
-def axiom_mode_without_env(argv0):
-    return re.split(r"[/\\]", str(argv0))[-1].lower() in {"axiom", "axiom.exe", "axiom.py"}
 
 
 def axiom_locations():
@@ -972,7 +1085,7 @@ def read_axiom_prefs(path):
 
 def axiom_db(app, mode):
     uri = (app["root"] / "db.sqlite").absolute().as_uri()
-    db = sqlite3.connect(f"{uri}?mode={mode}", uri=True, timeout=0.25)
+    db = sqlite3.connect(f"{uri}?mode={mode}", uri=True, timeout=AXIOM_DB_TIMEOUT)
     db.row_factory = sqlite3.Row
     return db
 
@@ -981,7 +1094,11 @@ def load_axiom_context():
     app = axiom_locations()
     if app is None:
         return {"root": None, "profiles": [], "prefs": {}, "prefix": "flutter.", "version": None}
-    reload_axiom_profiles(app)
+    try:
+        reload_axiom_profiles(app)
+    except sqlite3.Error as exc:
+        warn(f"база AxiOm недоступна ({exc}); профили приложения не используются")
+        app["version"], app["profiles"] = None, []
     try:
         app["prefs"] = read_axiom_prefs(app["prefs_path"])
     except (OSError, ValueError) as exc:
@@ -1005,8 +1122,10 @@ def reload_axiom_profiles(app):
 
 
 def app_writable(app):
+    if app["version"] is None:
+        raise AxiomDBUnavailable("база AxiOm недоступна (заблокирована или повреждена); запись невозможна")
     if app["version"] != AXIOM_DB_VERSION:
-        raise ValueError(f"база AxiOm версии {app['version']} открыта только для чтения; нужна версия {AXIOM_DB_VERSION}")
+        raise AxiomDBUnavailable(f"база AxiOm версии {app['version']} открыта только для чтения; нужна версия {AXIOM_DB_VERSION}")
 
 
 @contextmanager
@@ -1016,7 +1135,7 @@ def axiom_transaction(app):
         db.execute("BEGIN IMMEDIATE")
         version = db.execute("PRAGMA user_version").fetchone()[0]
         if version != AXIOM_DB_VERSION:
-            raise ValueError(f"база AxiOm версии {version} — только чтение; нужна версия {AXIOM_DB_VERSION}")
+            raise AxiomDBUnavailable(f"база AxiOm версии {version} — только чтение; нужна версия {AXIOM_DB_VERSION}")
         yield db
 
 
@@ -1030,9 +1149,49 @@ def profile_file(app, profile_id):
     return app["root"] / "configs" / f"{profile_id}.json"
 
 
+def owned_file():
+    return CONF_DIR / "axiom-profiles.json"
+
+
+def owned_profile_ids():
+    """ID профилей, созданных самим sbx (приложение этот список не видит)."""
+    try:
+        data = json.loads(owned_file().read_text(encoding="utf-8"))
+        return {item for item in data.get("owned", []) if isinstance(item, str)}
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def set_owned(profile_id, owned):
+    ids = owned_profile_ids()
+    ids.add(profile_id) if owned else ids.discard(profile_id)
+    write_private(owned_file(), json.dumps({"owned": sorted(ids)}))
+
+
+def app_cache_file(profile_id):
+    return SUBS_DIR / f"axiom-app-{profile_id}.json"
+
+
+def write_app_cache(profile_id, config, row_last_update):
+    write_private(app_cache_file(profile_id), json.dumps({"config": config, "row_last_update": row_last_update},
+                                                          ensure_ascii=False))
+
+
+def app_profile_text(app, row):
+    """Конфиг профиля: у профилей приложения — свежий кэш sbx, пока приложение не обновило строку."""
+    if row["id"] not in owned_profile_ids():
+        try:
+            cache = json.loads(app_cache_file(row["id"]).read_text(encoding="utf-8"))
+            if cache["row_last_update"] == row.get("last_update") and isinstance(cache["config"], str):
+                return cache["config"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return profile_file(app, row["id"]).read_text(encoding="utf-8-sig")
+
+
 def app_cache(app, row):
     try:
-        text = profile_file(app, row["id"]).read_text(encoding="utf-8-sig")
+        text = app_profile_text(app, row)
         servers, errors, _, _ = subscription_servers(text, app=True)
         if errors:
             warn(f"{app_sub_name(row)}: пропущено записей: {len(errors)}")
@@ -1108,7 +1267,12 @@ def metadata_int(value):
     return None
 
 
-def axiom_profile_metadata(url, headers, override):
+def is_url(value):
+    parts = urllib.parse.urlsplit(value or "")
+    return parts.scheme in {"http", "https"} and bool(parts.netloc)
+
+
+def axiom_profile_metadata(url, headers, override, existing_override=None):
     def header(key):
         value = headers.get(key)
         return value if isinstance(value, str) else ""
@@ -1131,18 +1295,21 @@ def axiom_profile_metadata(url, headers, override):
         expire = drift_date(info.get("expire") or 92233720368)
     else:
         upload = download = total = None
+    gated = bool(header("subscription-userinfo"))   # как приложение: ссылки только вместе с userinfo
+    web_page = header("profile-web-page-url") if gated and is_url(header("profile-web-page-url")) else None
+    support = header("support-url") if gated and is_url(header("support-url")) else None
     interval = None if override.get("isAutoUpdateDisable") else (
         metadata_int(override.get("updateInterval")) or metadata_int(header("profile-update-interval")))
     if interval is not None and interval > (2 ** 63 - 1) // 3600:
         interval = None
-    profile_override = {}
+    profile_override = dict(existing_override) if isinstance(existing_override, dict) else {}
     if header("enable-warp") == "true" or override.get("enableWarp") is True:
         profile_override.update({key: {"enable": True, "mode": "warp_over_proxy"} for key in ("warp", "warp2")})
     if header("enable-fragment") == "true" or override.get("enableFragment") is True:
         profile_override["tls-tricks"] = {"enable-fragment": True}
     return {"name": name, "last_update": drift_date(time.time()), "update_interval": interval and interval * 3600,
             "upload": upload, "download": download, "total": total, "expire": expire,
-            "web_page_url": header("profile-web-page-url") or None, "support_url": header("support-url") or None,
+            "web_page_url": web_page, "support_url": support,
             "populated_headers": json.dumps(headers, ensure_ascii=False),
             "profile_override": json.dumps(profile_override, ensure_ascii=False)}
 
@@ -1167,55 +1334,81 @@ def unique_profile_name(db, base, profile_id):
 
 
 def write_axiom_profile(app, *, name=None, url=None, local=None, current=None):
+    """Создать профиль (sbx становится его владельцем) или обновить существующий.
+
+    Профиль, созданный приложением, не перезаписывается: меняются только счётчики трафика и срок,
+    а свежие серверы лежат в кэше sbx. Свои профили sbx пишет целиком, с копией `.sbx-prev`.
+    """
     app_writable(app)
     profile_id = current["id"] if current else str(uuid.uuid4())
+    owned = current is None or profile_id in owned_profile_ids()
     body, headers = (Path(local).read_text(encoding="utf-8-sig"), {}) if local else axiom_fetch(url)
     config = app_profile_content(body)
     path = profile_file(app, profile_id)
     previous = None
     changed = False
+    marked = False
     try:
         with axiom_transaction(app) as db:
+            existing = {}
             if current:
                 row = db.execute("SELECT * FROM profile_entries WHERE id = ?", (profile_id,)).fetchone()
                 if row is None or row["url"] != url or row["last_update"] != current["last_update"]:
                     raise ValueError("профиль изменён приложением AxiOm; повторите обновление")
                 override = json.loads(row["user_override"] or "{}")
+                try:
+                    existing = json.loads(row["profile_override"] or "{}")
+                except ValueError:
+                    existing = {}
+                result = row["name"]
             else:
                 if url and db.execute("SELECT 1 FROM profile_entries WHERE instr(url, ?) > 0", (url,)).fetchone():
                     raise ValueError("такая подписка уже есть в AxiOm")
                 override = {"version": 1, "name": name} if name else {}
-            fields = axiom_profile_metadata(url, headers, override)
-            fields["name"] = unique_profile_name(db, fields["name"], profile_id)
-            if current:
-                db.execute(f"UPDATE profile_entries SET {', '.join(key + ' = ?' for key in fields)} WHERE id = ?",
-                           (*fields.values(), profile_id))
+            fields = axiom_profile_metadata(url, headers, override, existing)
+            if not owned:
+                counters = {key: fields[key] for key in ("upload", "download", "total", "expire", "last_update")}
+                if fields["upload"] is None:
+                    counters = {}
+                if counters:
+                    db.execute(f"UPDATE profile_entries SET {', '.join(key + ' = ?' for key in counters)} WHERE id = ?",
+                               (*counters.values(), profile_id))
+                write_app_cache(profile_id, config, counters.get("last_update", row["last_update"]))
             else:
-                db.execute("UPDATE profile_entries SET active = 0 WHERE active = 1")
-                fields.update(id=profile_id, url=url, type="local" if local else "remote", active=1,
-                              user_override=json.dumps(override, ensure_ascii=False) if override else None)
-                db.execute(f"INSERT INTO profile_entries ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
-                           tuple(fields.values()))
-            if path.exists():
-                previous = path.read_text(encoding="utf-8")
-            write_private(path, config)
-            changed = True
+                fields["name"] = unique_profile_name(db, fields["name"], profile_id)
+                result = fields["name"]
+                if current:
+                    db.execute(f"UPDATE profile_entries SET {', '.join(key + ' = ?' for key in fields)} WHERE id = ?",
+                               (*fields.values(), profile_id))
+                else:
+                    db.execute("UPDATE profile_entries SET active = 0 WHERE active = 1")
+                    fields.update(id=profile_id, url=url, type="local" if local else "remote", active=1,
+                                  user_override=json.dumps(override, ensure_ascii=False) if override else None)
+                    db.execute(f"INSERT INTO profile_entries ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+                               tuple(fields.values()))
+                    set_owned(profile_id, True)
+                    marked = True
+                if path.exists():
+                    previous = path.read_text(encoding="utf-8")
+                    write_private(path.with_name(path.name + ".sbx-prev"), previous)
+                write_private(path, config)
+                changed = True
     except BaseException:
         if changed:
             if previous is None:
                 path.unlink(missing_ok=True)
             else:
                 write_private(path, previous)
+        if marked:
+            set_owned(profile_id, False)
         raise
     reload_axiom_profiles(app)
-    return "app:" + fields["name"]
+    return "app:" + result
 
 
 def update_app_profiles(app, profiles, quiet):
+    """Обновить удалённые профили приложения. Недоступная для записи база — предупреждение, не отказ."""
     ok = True
-    if not any(profile.get("type") == "remote" for profile in profiles):
-        return True
-    app_writable(app)
     for row in profiles:
         if row.get("type") != "remote":
             continue
@@ -1223,7 +1416,9 @@ def update_app_profiles(app, profiles, quiet):
             name = write_axiom_profile(app, url=row["url"], current=row)
             if not quiet:
                 print(f"✓ {name}: обновлена")
-        except (OSError, sqlite3.Error, ValueError, TypeError, ImportError) as exc:
+        except (AxiomDBUnavailable, sqlite3.Error) as exc:
+            warn(f"{app_sub_name(row)}: не обновлена ({exc}); остаётся прошлый список")
+        except (OSError, ValueError, TypeError, ImportError) as exc:
             warn(f"{app_sub_name(row)}: не обновлена ({exc}); остаётся прошлый список")
             ok = False
     return ok
@@ -1239,6 +1434,9 @@ def remove_app_profile(app, name):
         if row["active"]:
             db.execute("UPDATE profile_entries SET active = 1 WHERE id = (SELECT id FROM profile_entries LIMIT 1)")
     path.unlink(missing_ok=True)
+    path.with_name(path.name + ".sbx-prev").unlink(missing_ok=True)
+    app_cache_file(row["id"]).unlink(missing_ok=True)
+    set_owned(row["id"], False)
     reload_axiom_profiles(app)
 
 
@@ -1390,6 +1588,17 @@ def axiom_options(servers):
     return options
 
 
+def axiom_extras(servers, options=None):
+    """Свои серверы sbx (подписки, ручные), которые нельзя выбрать по стране; идут после серверов приложения."""
+    options = axiom_options(servers) if options is None else options
+    used = {tag for _, tag in options}
+    return [server["tag"] for server in servers if not server.get("app_profile") and server["tag"] not in used]
+
+
+def axiom_prefs_now(app):
+    return [app.get("prefs", {}).get(app.get("prefix", "flutter.") + key) for key in AXIOM_PREFS]
+
+
 def axiom_sorted(options):
     unique = {}
     for key, tag in options:
@@ -1417,11 +1626,30 @@ def axiom_chosen(app, options):
     return next((tag for key, tag in group if key[2] == transport), group[0][1])
 
 
+@contextmanager
+def file_lock(path):
+    """Блокировка между процессами sbx на отдельном файле; не зависит от базы приложения."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def axiom_write_selection(app, choice):
     if not app["root"]:
         return
     path = app["prefs_path"]
-    with axiom_transaction(app):
+    with file_lock(CONF_DIR / ".axiom-prefs.lock"):
         prefs = read_axiom_prefs(path)
         keys = AXIOM_PREFS if choice else AXIOM_PREFS[:1]
         for key, value in zip(keys, choice or (AXIOM_AUTO,)):
@@ -1435,6 +1663,10 @@ def selected_server(st, servers):
     if app and app["root"]:
         options = axiom_options(servers)
         if options:
+            picked = st.get("axiom_extra")
+            if (isinstance(picked, dict) and picked.get("tag") in axiom_extras(servers, options)
+                    and picked.get("prefs") == axiom_prefs_now(app)):
+                return picked["tag"]   # свой сервер, выбранный после последнего выбора в приложении
             return axiom_chosen(app, options)
     return st["selected"]
 
@@ -1475,7 +1707,7 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
     tags = [s["tag"] for s in servers]
     rx = cfg_s.get("auto_exclude")
     options = axiom_options(servers) if st.get("_axiom") else []
-    eligible = list(dict.fromkeys(tag for _, tag in options)) or tags
+    eligible = list(dict.fromkeys([*(tag for _, tag in options), *axiom_extras(servers, options)])) if options else tags
     auto = [tag for tag in eligible if not (rx and re.search(rx, tag, re.I))] or eligible
     if options:
         available = set(auto)
@@ -1771,15 +2003,15 @@ WantedBy=timers.target
 
 
 def sudo_write(path, text):
-    run(["sudo", "tee", str(path)], input=text, stdout=subprocess.DEVNULL)
+    run(sudo_cmd("tee", str(path)), input=text, stdout=subprocess.DEVNULL)
 
 
 def install_units(st, quiet=False):
     if IS_WIN:
         return install_windows_tasks(st, quiet)
     svc, tmr = timer_units()
-    files = {UNIT_DIR / UNIT: unit_text(st), UNIT_DIR / "sbx-update.service": svc,
-             UNIT_DIR / "sbx-update.timer": tmr}
+    files = {UNIT_DIR / UNIT: unit_text(st), UNIT_DIR / f"{UPDATE}.service": svc,
+             UNIT_DIR / f"{UPDATE}.timer": tmr}
     changed = False
     for path, text in files.items():
         if not path.exists() or path.read_text() != text:
@@ -1788,7 +2020,7 @@ def install_units(st, quiet=False):
     if changed:
         systemctl("daemon-reload", sudo=True)
         if not quiet:
-            print("✓ юниты установлены: sbx.service, sbx-update.timer")
+            print(f"✓ юниты установлены: {UNIT}, {UPDATE}.timer")
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     return changed
 
@@ -1805,21 +2037,21 @@ def foreign_tun():
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 
 
-def task_call(action, name="sbx", *args, check=True, capture=True):
-    return run(["schtasks", f"/{action}", "/tn", name, *args], check=check, capture_output=capture)
+def task_call(action, name=None, *args, check=True, capture=True):
+    return run(["schtasks", f"/{action}", "/tn", name or BASE, *args], check=check, capture_output=capture)
 
 
 def task_running():
-    result = task_call("query", "sbx", "/fo", "csv", "/nh", check=False)
+    result = task_call("query", BASE, "/fo", "csv", "/nh", check=False)
     if result.returncode:
         return False
-    row = next(csv.reader(result.stdout.splitlines()), [])
+    row = next((r for r in csv.reader(result.stdout.splitlines()) if r), [])
     if row and row[-1].lower() == "running":
         return True
     if not row or row[-1].lower() in {"ready", "disabled", "queued"}:
         return False
     result = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                  "[int](Get-ScheduledTask -TaskName 'sbx' -TaskPath '\\').State"],
+                  f"[int](Get-ScheduledTask -TaskName '{BASE}' -TaskPath '\\').State"],
                  check=False, capture_output=True)
     return result.returncode == 0 and result.stdout.strip() == "4"
 
@@ -1835,7 +2067,7 @@ def task_enabled(name):
         return "disabled"
     namespace = {"t": TASK_NS}
     enabled = root.findtext("t:Settings/t:Enabled", "true", namespace)
-    if name == "sbx":
+    if name == BASE:
         boot = root.find("t:Triggers/t:BootTrigger", namespace)
         enabled = (boot.findtext("t:Enabled", "true", namespace)
                    if boot is not None and enabled == "true" else "false")
@@ -1891,7 +2123,7 @@ def protected_runtime():
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion",
                         access=winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
         program_files = Path(winreg.QueryValueEx(key, "ProgramFilesDir")[0])
-    return program_files / "SBX VPN" / "service"
+    return program_files / ("AxiOm" if BASE == "axiom" else "SBX VPN") / ("cli-service" if BASE == "axiom" else "service")
 
 
 def published_config(cfg, runtime):
@@ -1939,7 +2171,7 @@ def register_windows_service(boot):
     command = [str(runtime / "sing-box.exe"), "run", "-c", str(runtime / "config.json"),
                "-D", str(runtime)]
     xml = task_xml(command, "S-1-5-18", boot=boot, work=runtime, reader_sid=windows_user_sid())
-    register_task("sbx", xml, system=True)
+    register_task(BASE, xml, system=True)
 
 
 def install_windows_tasks(st, quiet=False):
@@ -1963,21 +2195,21 @@ def install_windows_tasks(st, quiet=False):
         else:
             install_core(runtime)
     publish_windows_config(st)
-    if task_definition("sbx") is None:
+    if task_definition(BASE) is None:
         register_windows_service(False)
-    if task_definition("sbx-update") is None:
+    if task_definition(UPDATE) is None:
         register_windows_updater()
 
 
 def windows_user_sid():
-    return next(csv.reader(run(["whoami", "/user", "/fo", "csv", "/nh"],
-                               capture_output=True).stdout.splitlines()))[-1]
+    rows = csv.reader(run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True).stdout.splitlines())
+    return next(row for row in rows if row)[-1]
 
 
 def register_windows_updater():
     args = ["sub", "update", "-q"] if axiom_mode() else ["update", "-q"]
     argv = launch_command(["--axiom", *args] if axiom_mode() else args)
-    register_task("sbx-update", task_xml(argv, windows_user_sid()))
+    register_task(UPDATE, task_xml(argv, windows_user_sid()))
 
 
 def prepare_service(st):
@@ -2131,7 +2363,8 @@ def resolve(st, query, allow_auto=True, *, use_axiom=False):
     options = axiom_sorted(axiom_options(servers)) if use_axiom and st.get("_axiom") else []
     if options:
         by_tag = {server["tag"]: server for server in servers}
-        servers = [by_tag[tag] for _, tag in options]
+        extras = axiom_extras(servers, [(key, tag) for key, tag in options])
+        servers = [by_tag[tag] for _, tag in options] + [by_tag[tag] for tag in extras]
     if query.isdigit():
         i = int(query)
         if 1 <= i <= len(servers):
@@ -2155,9 +2388,6 @@ def cmd_ls(st, a):
         return
     if st.get("_axiom") and (options := axiom_options(servers)):
         ls_axiom(st, servers, options, a.filter)
-        return
-    if st.get("_axiom"):
-        print("нет серверов, подходящих для выбора по стране в AxiOm")
         return
     now = current_node(st) if is_active(st) else None
     live = now.split(" → ")[-1] if now else None
@@ -2184,13 +2414,16 @@ def cmd_use(st, a):
         choice = next((key for key, node in options if node == tag), None)
         if tag == "auto" or choice:
             axiom_write_selection(app, choice)
+            st.pop("axiom_extra", None)
+        elif options and tag in axiom_extras(all_servers(st), options):
+            st["axiom_extra"] = {"tag": tag, "prefs": axiom_prefs_now(app)}
     st["selected"] = tag
     save_state(st)
     apply(st, reload=False)
     if is_active(st) and api_up(st):
         api(st, "PUT", "/proxies/proxy", {"name": tag})
 
-    if IS_WIN and interactive() and task_definition("sbx") is not None:
+    if IS_WIN and interactive() and task_definition(BASE) is not None:
         warn("для сохранения выбора после перезагрузки задачи SYSTEM: sbx restart")
     print(f"✓ выбран {tag}")
 
@@ -2210,7 +2443,8 @@ def ls_axiom(st, servers, options, query):
     best = axiom_fastest(options, latencies)
     print(f"{'●' if selected == 'auto' else ' '}   0  Авто (самый быстрый)" + (f" → {best}" if best else ""))
     previous = ()
-    for index, (key, tag) in enumerate(axiom_sorted(options), 1):
+    ordered = axiom_sorted(options)
+    for index, (key, tag) in enumerate(ordered, 1):
         if query and query.lower() not in tag.lower():
             continue
         country, protocol, transport = key
@@ -2223,6 +2457,15 @@ def ls_axiom(st, servers, options, query):
         delay = latencies.get(tag, 0)
         detail = f" · {delay} мс" if isinstance(delay, int) and 0 < delay < 65000 else ""
         print(f"{mark}   {index:>2}  {AXIOM_TRANSPORTS[transport]}{detail}")
+    extras = [tag for tag in axiom_extras(servers, options) if not query or query.lower() in tag.lower()]
+    if extras:
+        print("Свои серверы")
+        by_tag = {server["tag"]: server for server in servers}
+        for tag in extras:
+            index = len(ordered) + axiom_extras(servers, options).index(tag) + 1
+            delay = latencies.get(tag, 0)
+            detail = f" · {delay} мс" if isinstance(delay, int) and 0 < delay < 65000 else ""
+            print(f"{'●' if selected == tag else ' '}   {index:>2}  {tag}  [{by_tag[tag]['source']}]{detail}")
 
 
 class Prober:
@@ -2289,6 +2532,8 @@ def cmd_test(st, a):
         options = axiom_sorted(axiom_options(servers))
         if options:
             indices = {tag: index for index, (_, tag) in enumerate(options, 1)}
+            for tag in axiom_extras(servers, options):
+                indices[tag] = len(indices) + 1
             servers = [server for server in servers if server["tag"] in indices]
         else:
             indices = {}
@@ -2352,18 +2597,29 @@ def numbered_choice(options):
     return options[int(answer)]
 
 
-def pick_axiom(options):
+OWN_SERVERS = "\0own"
+
+
+def pick_axiom(options, extras=()):
     options = axiom_sorted(options)
     countries = list(dict.fromkeys(key[0] for key, _ in options))
     print("  0  Авто (самый быстрый)")
     print("Страна:")
     for index, country in enumerate(countries, 1):
         print(f"{index:>3}  {axiom_flag(country)} {country}")
-    country = numbered_choice({0: AXIOM_AUTO, **dict(enumerate(countries, 1))})
+    choices = {0: AXIOM_AUTO, **dict(enumerate(countries, 1))}
+    if extras:
+        choices[len(countries) + 1] = OWN_SERVERS
+        print(f"{len(countries) + 1:>3}  Свои серверы")
+    country = numbered_choice(choices)
     if country is None:
         return None
     if country == AXIOM_AUTO:
         return "auto"
+    if country == OWN_SERVERS:
+        for index, tag in enumerate(extras, 1):
+            print(f"{index:>3}  {tag}")
+        return numbered_choice(dict(enumerate(extras, 1)))
     options = [(key, tag) for key, tag in options if key[0] == country]
     protocols = list(dict.fromkeys(key[1] for key, _ in options))
     if len(protocols) > 1:
@@ -2391,17 +2647,18 @@ def cmd_pick(st, a):
     except ImportError:
         curses = None
     import threading
+    if not interactive():
+        die("нужен терминал; без него: sbx use НОМЕР|ИМЯ|auto")
     servers = all_servers(st)
     if not servers:
         die("серверов нет: sbx sub add ИМЯ URL")
     if st.get("_axiom"):
         options = axiom_options(servers)
         if options:
-            choice = pick_axiom(options)
+            choice = pick_axiom(options, axiom_extras(servers, options))
             if choice is not None:
                 cmd_use(st, argparse.Namespace(server=choice))
             return choice
-        die("нет серверов, подходящих для выбора по стране в AxiOm; можно выбрать auto")
     if curses is None or not interactive() or not os.environ.get("TERM") and not IS_WIN:
         options = {0: "auto", **{index: server["tag"] for index, server in enumerate(servers, 1)}}
         for index, tag in options.items():
@@ -2570,10 +2827,10 @@ def cmd_probe(st, a):
     before = ip_snapshot()
     user = os.environ.get("USER") or HOME.name
     caps = "CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE"
-    run(["sudo", "systemctl", "reset-failed", PROBE_UNIT], check=False, capture_output=True)
-    run(["sudo", "systemd-run", f"--unit={PROBE_UNIT}", f"--uid={user}", f"--gid={user}",
-         "-p", f"AmbientCapabilities={caps}", "-p", f"CapabilityBoundingSet={caps}",
-         "--quiet", "--collect", SING_BOX, "run", "-c", str(cfg_path), "-D", str(probe_dir)])
+    run(sudo_cmd("systemctl", "reset-failed", PROBE_UNIT), check=False, capture_output=True)
+    run(sudo_cmd("systemd-run", f"--unit={PROBE_UNIT}", f"--uid={user}", f"--gid={user}",
+                 "-p", f"AmbientCapabilities={caps}", "-p", f"CapabilityBoundingSet={caps}",
+                 "--quiet", "--collect", SING_BOX, "run", "-c", str(cfg_path), "-D", str(probe_dir)))
     results = []
 
     def step(name, good, detail=""):
@@ -2628,7 +2885,7 @@ def cmd_probe(st, a):
         diff = (after - before) | (before - after)
         step("маршруты и ip rule не тронуты", not diff, "; ".join(sorted(diff))[:300])
     finally:
-        run(["sudo", "systemctl", "stop", PROBE_UNIT], check=False, capture_output=True)
+        run(sudo_cmd("systemctl", "stop", PROBE_UNIT), check=False, capture_output=True)
         gone = not run(["ip", "link", "show", PROBE_IF], check=False, capture_output=True).stdout
         print(f"{'✓' if gone else '✗'} проба остановлена, {PROBE_IF} {'удалён' if gone else 'остался!'}")
     if not all(results):
@@ -2680,7 +2937,7 @@ def cmd_restart(st, a):
 
 def show_status(st):
     active = is_active(st)
-    enabled = task_enabled("sbx") if IS_WIN else unit_prop("UnitFileState")
+    enabled = task_enabled(BASE) if IS_WIN else unit_prop("UnitFileState")
     s = st["settings"]
     print(f"состояние:   {'работает' if active else 'выключен'}"
           f"  (автозапуск: {'да' if enabled == 'enabled' else 'нет'})")
@@ -2702,7 +2959,7 @@ def show_status(st):
                   f"  · соединений {len(conns.get('connections') or [])}")
         except (urllib.error.URLError, OSError, ValueError):
             pass
-    t = task_enabled("sbx-update") if IS_WIN else unit_prop_of("sbx-update.timer", "UnitFileState")
+    t = task_enabled(UPDATE) if IS_WIN else unit_prop_of(f"{UPDATE}.timer", "UnitFileState")
     manual = "вручную (axiom sub update)" if st.get("_axiom") else "вручную (sbx update)"
     print(f"обновление:  {'по таймеру раз в 6 ч' if t == 'enabled' else manual}")
 
@@ -2761,11 +3018,11 @@ def cmd_enable(st, a):
     prepare_service(st)
     if IS_WIN:
         register_windows_service(True)
-        task_call("change", "sbx-update", "/enable", capture=False)
-        print("✓ автозапуск включён (задачи sbx и sbx-update)")
+        task_call("change", UPDATE, "/enable", capture=False)
+        print(f"✓ автозапуск включён (задачи {BASE} и {UPDATE})")
     else:
-        systemctl("enable", UNIT, "sbx-update.timer", sudo=True)
-        print("✓ автозапуск включён (sbx.service + sbx-update.timer)")
+        systemctl("enable", UNIT, f"{UPDATE}.timer", sudo=True)
+        print(f"✓ автозапуск включён ({UNIT} + {UPDATE}.timer)")
     if a.now and not is_active(st):
         cmd_up(st, argparse.Namespace(force=False))
 
@@ -2774,15 +3031,15 @@ def cmd_disable(st, a):
     if not require_windows_admin():
         return
     if IS_WIN:
-        if task_definition("sbx") is not None:
+        if task_definition(BASE) is not None:
             register_windows_service(False)
-        if a.timer and task_definition("sbx-update") is not None:
-            task_call("change", "sbx-update", "/disable", capture=False)
+        if a.timer and task_definition(UPDATE) is not None:
+            task_call("change", UPDATE, "/disable", capture=False)
         print("✓ автозапуск выключен (работающий VPN не тронут)")
         return
     systemctl("disable", UNIT, sudo=True)
     if a.timer:
-        systemctl("disable", "sbx-update.timer", sudo=True)
+        systemctl("disable", f"{UPDATE}.timer", sudo=True)
     print("✓ автозапуск выключен (работающий VPN не тронут)")
 
 
@@ -3012,18 +3269,35 @@ def cmd_install(st, a):
 def cmd_uninstall(st, a):
     if not require_windows_admin():
         return
+    failures = []
+
+    def attempt(what, cmd, **kw):
+        result = run(cmd, check=False, **kw)
+        if result.returncode:
+            failures.append(what)
+        return result
+
     if IS_WIN:
         task_call("end", check=False)
-        for name in ("sbx", "sbx-update"):
+        for name in (BASE, UPDATE):
             if task_definition(name) is not None:
-                task_call("delete", name, "/f", capture=False)
+                attempt(f"задача {name}", ["schtasks", "/delete", "/tn", name, "/f"])
+        if failures:
+            die("не удалось удалить: " + ", ".join(failures))
         print(f"✓ задачи удалены; подписки и настройки остались в {CONF_DIR}")
         return
-    systemctl("disable", "--now", UNIT, "sbx-update.timer", sudo=True, check=False)
-    for f in (UNIT, "sbx-update.service", "sbx-update.timer"):
-        run(["sudo", "rm", "-f", str(UNIT_DIR / f)], check=False)
-    systemctl("daemon-reload", sudo=True)
-    print(f"✓ юниты удалены; подписки и настройки остались в {CONF_DIR}")
+    names = [UNIT, f"{UPDATE}.service", f"{UPDATE}.timer"]
+    present = [name for name in names if (UNIT_DIR / name).exists()]
+    if present:
+        attempt("остановка юнитов", sudo_cmd("systemctl", "disable", "--now",
+                                             *[n for n in present if n != f"{UPDATE}.service"]))
+        for name in present:
+            attempt(f"удаление {name}", sudo_cmd("rm", "-f", str(UNIT_DIR / name)))
+        attempt("daemon-reload", sudo_cmd("systemctl", "daemon-reload"))
+    if failures:
+        die("не удалось выполнить: " + ", ".join(failures))
+    print(f"✓ юниты удалены; подписки и настройки остались в {CONF_DIR}" if present
+          else f"юниты {BASE} не установлены; подписки и настройки остались в {CONF_DIR}")
 
 
 def cmd_config(st, a):
@@ -3068,7 +3342,10 @@ def cmd_import(st, a):
         while name in taken:
             name = f"{base}-{index}"
             index += 1
-        cmd_sub(st, argparse.Namespace(action="add", name=name, url=source, ua=None, no_hwid=False))
+        app = st.get("_axiom")
+        # с приложением имя профиля берётся из заголовков панели, а не из хоста
+        cmd_sub(st, argparse.Namespace(action="add", name=None if app and app["root"] else name,
+                                       url=source, ua=None, no_hwid=False))
         return
     path = Path(source).expanduser().resolve(strict=True)
     if (app := st.get("_axiom")) and app["root"]:
@@ -3111,22 +3388,63 @@ def update_arguments(parser, *, self_update=False):
     parser.set_defaults(func=cmd_self_update if self_update else cmd_update)
 
 
+def take_elevated_prefix(argv):
+    """Скрытые флаги повышенного запуска (только после --elevated-for) -> (журнал, остаток argv)."""
+    argv = list(argv)
+    flags, log, branded = {}, None, False
+    while argv and (argv[0] in ELEVATED_ENV or argv[0] in {"--elevated-for", "--elevated-log"}
+                    or argv[0] == "--axiom"):
+        flag = argv.pop(0)
+        if flag == "--axiom":
+            branded = True
+            continue
+        if not argv:
+            die(f"{flag} требует значение")
+        flags[flag] = argv.pop(0)
+    if "--elevated-for" in flags:
+        if not IS_WIN or not windows_admin() or windows_user_sid() != flags["--elevated-for"]:
+            die("UAC требует повышение прав той же учётной записи Windows")
+    elif set(flags) & (set(ELEVATED_ENV) | {"--elevated-log"}):
+        die("скрытые флаги допустимы только после --elevated-for")
+    for flag, key in ELEVATED_ENV.items():
+        if flag in flags:
+            os.environ[key] = flags[flag]
+    if branded:
+        os.environ["SBX_BRAND"] = "axiom"
+    if flags or branded:
+        configure_identity(axiom_mode())
+    return flags.get("--elevated-log"), argv
+
+
 def main(argv=None):
+    global NO_ELEVATE
     remove_old_exe()
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv[:1] == ["--elevated-for"]:
-        if not IS_WIN or len(argv) < 3 or not windows_admin() or windows_user_sid() != argv[1]:
-            die("UAC требует повышение прав той же учётной записи Windows")
-        del argv[:2]
-    if argv[:1] == ["--axiom"]:
-        os.environ["SBX_BRAND"] = "axiom"
-        argv.pop(0)
+    log, argv = take_elevated_prefix(argv)
+    if "--no-elevate" in argv:
+        argv = [item for item in argv if item != "--no-elevate"]
+        NO_ELEVATE = True
+    if not log:
+        return run_cli(argv)
+    saved = sys.stdout, sys.stderr
+    with open(log, "w", encoding="utf-8", newline="\n") as stream:
+        sys.stdout = sys.stderr = stream
+        try:
+            return run_cli(argv)
+        finally:
+            stream.flush()
+            sys.stdout, sys.stderr = saved
+
+
+def run_cli(argv):
     branded = axiom_mode()
     prog = "axiom" if branded else "sbx"
     p = argparse.ArgumentParser(prog=prog, description=__doc__.split("\n")[0],
                                 epilog=__doc__.split("\n\n", 1)[1],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-V", "--version", action="version", version=f"{prog} {__version__}")
+    p.add_argument("--no-elevate", action="store_true",
+                   help="Windows: не запрашивать UAC; если нужны права — сообщить и выйти с кодом 2")
     sp = p.add_subparsers(dest="cmd", metavar="команда")
 
     update_arguments(sp.add_parser("self-update", help="обновить сам sbx из GitHub Releases"), self_update=True)
@@ -3243,12 +3561,11 @@ def main(argv=None):
             st["_axiom"] = load_axiom_context()
         if not STATE_FILE.exists():
             save_state(st)
-        if a.cmd != "core":
-            maybe_notice_update(st, a)
         a.func(st, a)
         if st.get("_reload_windows"):
             print("Для применения нового конфига надо перезапустить задачу sbx (UAC).", flush=True)
             request_windows_admin(["restart"])
+        maybe_notice_update(st, a)
     except subprocess.CalledProcessError as e:
         die(f"команда завершилась с ошибкой: {' '.join(map(str, e.cmd))}")
     except (OSError, ValueError, KeyError, ImportError, sqlite3.Error, zipfile.BadZipFile, ET.ParseError) as e:
