@@ -615,9 +615,41 @@ def test_select_sent_before_cli_apply(sync, cli, monkeypatch):
 
     monkeypatch.setattr(sbx, 'apply', broken)
     with FakeApp(sync) as app:
-        with pytest.raises(RuntimeError):
-            sbx.cmd_use(axiom_state(), argparse.Namespace(server='1'))
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server='1'))    # выбор принят приложением — код 0
     assert [c['cmd'] for c in app.executed] == ['select']
+
+
+def test_select_ok_with_no_own_servers(monkeypatch, sync, cli, capsys):
+    """Серверов у CLI нет (apply умирает) — выбор всё равно принят приложением, выход 0."""
+    def no_servers(st, reload=True, quiet=False):
+        sbx.die('серверов нет')
+
+    monkeypatch.setattr(sbx, 'apply', no_servers)
+    with FakeApp(sync) as app:
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server=None, select='France||'))
+        sbx.cmd_connect(axiom_state(), argparse.Namespace(number=None, select='France||', force=False))
+    assert [c['cmd'] for c in app.executed] == ['select', 'select']
+    assert 'принят приложением' in capsys.readouterr().out
+    monkeypatch.setattr(sbx, 'sync_dir', lambda: None)               # без приложения ошибка apply остаётся ошибкой
+    with pytest.raises(SystemExit):
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server='1'))
+
+
+def test_unparsable_start_lock_counts_as_held(sync):
+    lock = sync / 'start.lock'
+    for content in ('', '{half', '[]'):
+        lock.write_text(content)
+        assert sbx.start_lock_fresh(sbx.read_start_lock(sync))
+        assert sbx.app_vpn_on(sync) is not None
+        with sbx.start_reservation(sync) as mine:
+            assert mine is False
+        assert lock.exists()                                        # чужой пустой лок не снят
+    old = time.time() - 61
+    os.utime(lock, (old, old))                                      # возраст по mtime: старше 60 с — брошен
+    assert not sbx.start_lock_fresh(sbx.read_start_lock(sync))
+    assert sbx.app_vpn_on(sync) is None
+    with sbx.start_reservation(sync) as mine:
+        assert mine is True
 
 
 def test_select_resolved_against_app_menu_without_cli_servers(sync, cli):

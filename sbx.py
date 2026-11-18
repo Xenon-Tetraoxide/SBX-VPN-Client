@@ -1921,10 +1921,14 @@ def app_engine_connected(sync=None):
 
 
 def read_start_lock(sync):
-    data = read_sync_json(sync / "start.lock")
+    path = sync / "start.lock"
+    data = read_sync_json(path)
     if data and data.get("owner") in ("app", "cli") and isinstance(data.get("id"), str) and is_int(data.get("ts")):
         return data
-    return None
+    try:       # файл есть, но пуст/не разобран (создаётся эксклюзивно, содержимое пишется вторым шагом): занят, возраст по mtime
+        return {"owner": "unknown", "id": "", "ts": int(path.stat().st_mtime * 1000)}
+    except OSError:
+        return None
 
 
 def start_lock_fresh(lock):
@@ -1940,7 +1944,7 @@ def app_vpn_on(sync=None):
     if state and (state["connected"] or state.get("connecting")):
         return state
     lock = read_start_lock(sync)
-    if lock and lock["owner"] == "app" and start_lock_fresh(lock):
+    if lock and lock["owner"] != "cli" and start_lock_fresh(lock):
         return {"connected": False, "connecting": True, "selection": None, "rawTag": None}
     return None
 
@@ -2062,7 +2066,7 @@ def wait_app_start_finished(sync):
     while time.monotonic() < deadline:
         state = app_state(sync)
         lock = read_start_lock(sync)
-        starting = (state and state.get("connecting")) or (lock and lock["owner"] == "app" and start_lock_fresh(lock))
+        starting = (state and state.get("connecting")) or (lock and lock["owner"] != "cli" and start_lock_fresh(lock))
         if not starting:
             return
         time.sleep(SYNC_POLL)
@@ -3024,7 +3028,15 @@ def cmd_use(st, a):
     save_state(st)
     if send:
         send_app_command(sync, "select", triple)      # раньше конфига CLI: приложению не нужны ни ядро, ни apply
-    apply(st, reload=False)
+    try:
+        apply(st, reload=False)
+    except (SystemExit, Exception) as e:
+        if not send:
+            raise
+        code = e.code if isinstance(e, SystemExit) else e
+        print(f"ℹ выбор принят приложением AxiOm; конфиг CLI не обновлён ({code})")
+        print(f"✓ выбран {tag}")
+        return
     if is_active(st) and api_up(st):
         api(st, "PUT", "/proxies/proxy", {"name": tag})
 
