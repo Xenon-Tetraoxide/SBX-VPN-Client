@@ -573,7 +573,8 @@ def test_console_tools_decode_oem_and_others_utf8(monkeypatch):
 def test_failed_post_command_update_keeps_primary_exit_code(monkeypatch, capsys):
     windows(monkeypatch)
     monkeypatch.setattr(sbx, 'interactive', lambda: True)
-    monkeypatch.delenv('SBX_NO_UPDATE_CHECK')
+    monkeypatch.delenv('SBX_NO_UPDATE_CHECK', raising=False)
+    monkeypatch.delenv('INVOCATION_ID', raising=False)   # есть у раннеров на systemd
     monkeypatch.setattr(sbx, 'take_update_slot', lambda st: True)
     monkeypatch.setattr(sbx, 'latest_update', lambda: {'tag_name': 'v9.9.9', 'assets': []})
     monkeypatch.setattr(sbx, 'update_prompt', lambda release: True)
