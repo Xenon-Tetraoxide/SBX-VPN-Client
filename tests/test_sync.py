@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -56,7 +57,12 @@ def cli(monkeypatch):
     monkeypatch.setattr(sbx, 'is_active', lambda st: calls['active'])
     monkeypatch.setattr(sbx, 'api_up', lambda st, port=None: calls['active'])
     monkeypatch.setattr(sbx, 'api', lambda st, method, path, body=None, **kw: calls['api'].append((method, path, body)))
-    monkeypatch.setattr(sbx, 'service_action', lambda action: calls['service'].append(action))
+    def service_action(action):
+        calls['service'].append(action)
+        calls['active'] = action != 'stop'
+        calls['lock_during'] = (sbx.sync_dir() / 'start.lock').exists() if sbx.sync_dir() else None
+
+    monkeypatch.setattr(sbx, 'service_action', service_action)
     monkeypatch.setattr(sbx, 'prepare_service', lambda st: None)
     monkeypatch.setattr(sbx, 'refuse_other_brand', lambda st, force: None)
     monkeypatch.setattr(sbx, 'require_windows_admin', lambda argv=None: True)
@@ -74,16 +80,24 @@ def axiom_state():
 
 
 class FakeApp:
-    """Приложение по протоколу: сердцебиение app-state.json, опрос control.json, control-ack.json."""
+    """Приложение по протоколу v2: сердцебиение app-state.json (connecting), start.lock, control.json/ack, долговечная дедупликация."""
 
-    def __init__(self, sync, *, connected=True, beat=True, ack=True, ok=True, delay=0.0,
+    def __init__(self, sync, *, connected=True, connecting=False, beat=True, ack=True, ok=True, delay=0.0,
                  selection=('__auto__', '', ''), raw_tag='France (x) [hy2]'):
-        self.sync, self.connected, self.beat, self.ack_enabled, self.ok = sync, connected, beat, ack, ok
-        self.delay, self.selection, self.raw_tag = delay, list(selection), raw_tag
+        self.sync, self.connected, self.connecting, self.beat = sync, connected, connecting, beat
+        self.ack_enabled, self.ok, self.delay = ack, ok, delay
+        self.selection, self.raw_tag = list(selection), raw_tag
         self.executed = []
-        self.seen = set()
+        # долговечная дедупликация: команда, на которую уже есть ack с тем же id, не исполняется после перезапуска
+        self.seen = {a['id'] for a in [self.read('control-ack.json')] if a}
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
+
+    def read(self, name):
+        try:
+            return json.loads((self.sync / name).read_text())
+        except (OSError, ValueError):
+            return None
 
     def write(self, name, document):
         tmp = self.sync / f'.{name}.tmp'
@@ -93,17 +107,20 @@ class FakeApp:
     def publish(self, heartbeat=None):
         self.write('app-state.json', {
             'v': 1, 'pid': os.getpid(), 'heartbeat': now_ms() if heartbeat is None else heartbeat,
-            'connected': self.connected, 'connecting': False,
+            'connected': self.connected, 'connecting': self.connecting,
             'selection': dict(zip('cpt', self.selection)), 'rawTag': self.raw_tag if self.connected else None})
+
+    def hold_start_lock(self, age_ms=0):
+        self.write('start.lock', {'owner': 'app', 'id': str(uuid.uuid4()), 'ts': now_ms() - age_ms})
+
+    def release_start_lock(self):
+        (self.sync / 'start.lock').unlink(missing_ok=True)
 
     def loop(self):
         while not self.stop.is_set():
             if self.beat:
                 self.publish()
-            try:
-                command = json.loads((self.sync / 'control.json').read_text())
-            except (OSError, ValueError):
-                command = None
+            command = self.read('control.json')
             if command and command['id'] not in self.seen:
                 self.seen.add(command['id'])
                 if now_ms() - command['ts'] <= 30_000:
@@ -114,9 +131,13 @@ class FakeApp:
         time.sleep(self.delay)
         self.executed.append(command)
         if command['cmd'] == 'disconnect':
-            self.connected = False
+            self.connected = self.connecting = False
         elif command['cmd'] == 'select':
             self.selection = [command['selection'][key] for key in 'cpt']
+            if self.selection[0] == '__auto__':
+                self.selection = ['__auto__', '', '']
+            prefs = self.sync.parent / 'shared_preferences.json'
+            prefs.write_text(json.dumps({'flutter.server_selector_country': self.selection[0]}))
         if self.ack_enabled:
             body = {'v': 1, 'id': command['id'], 'ok': self.ok, 'ts': now_ms()}
             if not self.ok:
@@ -192,12 +213,13 @@ def test_write_control_format_and_atomic(monkeypatch, sync):
 
 
 def test_wait_ack_matches_id_only(sync):
-    (sync / 'control-ack.json').write_text(json.dumps({'v': 1, 'id': 'old', 'ok': True, 'ts': 1}))
-    assert sbx.wait_ack(sync, 'new') is None           # чужой (старый) ack не годится
+    old, new = str(uuid.uuid4()), str(uuid.uuid4())
+    (sync / 'control-ack.json').write_text(json.dumps({'v': 1, 'id': old, 'ok': True, 'ts': 1}))
+    assert sbx.wait_ack(sync, new) is None             # чужой (старый) ack не годится
     timer = threading.Timer(0.1, lambda: (sync / 'control-ack.json').write_text(
-        json.dumps({'v': 1, 'id': 'new', 'ok': True, 'ts': 2})))
+        json.dumps({'v': 1, 'id': new, 'ok': True, 'ts': 2})))
     timer.start()
-    assert sbx.wait_ack(sync, 'new')['ok'] is True
+    assert sbx.wait_ack(sync, new)['ok'] is True
     timer.join()
 
 
@@ -259,8 +281,6 @@ def test_up_noop_when_app_connected(sync, cli, capsys):
 
 def test_up_starts_own_engine_when_app_off(monkeypatch, sync, cli):
     monkeypatch.setattr(sbx, 'show_status', lambda st: None)
-    flags = iter([False, True])
-    monkeypatch.setattr(sbx, 'is_active', lambda st: next(flags, True))
     monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
     with FakeApp(sync, connected=False) as app:
         sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
@@ -293,8 +313,6 @@ def test_connect_number_with_app_engine(sync, cli):
 
 def test_connect_without_app_unchanged(monkeypatch, sync, cli):
     monkeypatch.setattr(sbx, 'show_status', lambda st: None)
-    flags = iter([False, False, True])
-    monkeypatch.setattr(sbx, 'is_active', lambda st: next(flags, True))
     monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
     sbx.cmd_connect(axiom_state(), argparse.Namespace(number=None, select='__auto__', force=False))
     assert cli['service'] == ['start'] and not (sync / 'control.json').exists()
@@ -306,7 +324,8 @@ def test_use_prefers_cli_engine(sync, cli):
     cli['active'] = True
     with FakeApp(sync) as app:
         sbx.cmd_use(axiom_state(), argparse.Namespace(server='1'))
-    assert cli['api'] == [('PUT', '/proxies/proxy', {'name': FRANCE})] and app.executed == []
+    assert cli['api'] == [('PUT', '/proxies/proxy', {'name': FRANCE})]
+    assert [c['cmd'] for c in app.executed] == ['select']       # приложение тоже получает выбор (оно его сохраняет)
 
 
 def test_use_sends_select_to_app(sync, cli):
@@ -314,6 +333,7 @@ def test_use_sends_select_to_app(sync, cli):
         sbx.cmd_use(axiom_state(), argparse.Namespace(server='2'))      # 2 = Netherlands / vless / tcp
     assert app.executed[0]['selection'] == {'c': 'Netherlands', 'p': 'vless', 't': 'tcp'}
     assert app.selection == ['Netherlands', 'vless', 'tcp'] and cli['api'] == []
+    assert not (sync.parent / 'shared_preferences.json').read_text().count('vless')   # файл писало только приложение
 
 
 def test_use_auto_sends_auto(sync, cli):
@@ -347,10 +367,11 @@ def test_select_validation(sync, cli, capsys):
     st = axiom_state()
     assert sbx.resolve_select(st, '__auto__||') == (('__auto__', '', ''), 'auto')
     assert sbx.resolve_select(st, '__auto__') == (('__auto__', '', ''), 'auto')
+    assert sbx.resolve_select(st, '__auto__|x|y') == (('__auto__', '', ''), 'auto')   # p/t при auto игнорируются
     assert sbx.resolve_select(st, 'France|hysteria2|hy2') == (FRANCE_KEY, FRANCE)
     assert sbx.resolve_select(st, 'France||') == (FRANCE_KEY, FRANCE)       # пустые p/t — первые по меню
     assert sbx.resolve_select(st, 'Netherlands|vless|ws') == (('Netherlands', 'vless', 'ws'), NETHERLANDS)
-    for bad in ('Mars|vless|ws', 'France|vless|ws', 'France|hysteria2|tcp', '|a|b', 'a|b|c|d', '__auto__|x|'):
+    for bad in ('Mars|vless|ws', 'France|vless|ws', 'France|hysteria2|tcp', '|a|b', 'a|b|c|d'):
         with pytest.raises(SystemExit) as exc:
             sbx.resolve_select(st, bad)
         assert exc.value.code == 1
@@ -488,3 +509,444 @@ def test_old_cli_dispatch_fetches_subscription(monkeypatch, old_cli_dir, capsys)
     monkeypatch.setattr(sbx, 'cmd_ls', lambda st, a: fetched.append('ls'))
     sbx.main(['ls'])
     assert fetched == [['axiom'], 'ls']
+
+
+# ══ v2 ═══════════════════════════════════════════════════════════════════════
+
+def test_version_gate():
+    assert tuple(int(x) for x in sbx.__version__.split('.')) >= (1, 4, 0)
+
+
+# ── 1: app-location.json ────────────────────────────────────────────────────
+
+def make_location(tmp_path, **override):
+    support = tmp_path / 'portable-support'
+    support.mkdir(exist_ok=True)
+    (support / 'db.sqlite').write_bytes(b'')
+    doc = {'v': 1, 'support_dir': str(support), 'sync_dir': str(tmp_path / 'elsewhere-sync'),
+           'prefs_file': str(tmp_path / 'prefs.json'), 'prefs_prefix': 'portable.', 'exe': '/x/axiom-app',
+           'pid': os.getpid(), 'ts': now_ms()}
+    doc.update(override)
+    (sbx.CONF_DIR).mkdir(parents=True, exist_ok=True)
+    (sbx.CONF_DIR / 'app-location.json').write_text(json.dumps(doc))
+    return support, doc
+
+
+def test_app_location_used_first(monkeypatch, tmp_path):
+    monkeypatch.delenv('SBX_AXIOM_HOME', raising=False)
+    monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path / 'nothing'))
+    monkeypatch.setattr(sbx, 'IS_WIN', False)
+    monkeypatch.setattr(sbx, 'BASE', 'axiom')
+    support, doc = make_location(tmp_path)
+    app = sbx.axiom_locations()
+    assert app['root'] == support and app['prefix'] == 'portable.'
+    assert app['prefs_path'] == Path(doc['prefs_file']) and app['sync_dir'] == Path(doc['sync_dir'])
+    assert sbx.sync_dir() == Path(doc['sync_dir'])
+
+
+def test_app_location_stale_or_invalid_ignored(monkeypatch, tmp_path):
+    monkeypatch.delenv('SBX_AXIOM_HOME', raising=False)
+    monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path / 'nothing'))
+    monkeypatch.setattr(sbx, 'IS_WIN', False)
+    old = now_ms() - 25 * 3600 * 1000
+    make_location(tmp_path, ts=old, pid=2 ** 22 + 12345)          # мёртвый pid и старше суток
+    assert sbx.axiom_locations() is None
+    make_location(tmp_path, ts=old, pid=os.getpid())               # живой pid — годится при любом ts
+    assert sbx.axiom_locations() is not None
+    make_location(tmp_path, ts=now_ms(), pid=2 ** 22 + 12345)      # свежий ts — годится
+    assert sbx.axiom_locations() is not None
+    for bad in ({'v': 2}, {'prefs_prefix': 'x.'}, {'sync_dir': 'relative'}, {'ts': 'now'}):
+        make_location(tmp_path, **bad)
+        assert sbx.axiom_locations() is None
+    (sbx.CONF_DIR / 'app-location.json').write_text('{bad')
+    assert sbx.axiom_locations() is None
+
+
+def test_app_location_ignored_with_explicit_home(monkeypatch, tmp_path, app_dir):
+    make_location(tmp_path)
+    assert sbx.axiom_locations()['root'] == app_dir               # SBX_AXIOM_HOME главнее
+
+
+# ── 2: единственный писатель настроек ─────────────────────────────────────
+
+def prefs_file(app_dir):
+    return app_dir / 'shared_preferences.json'
+
+
+def test_no_prefs_write_while_app_running(app_dir, sync, cli):
+    with FakeApp(sync) as app:
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server='1'))
+    assert [c['cmd'] for c in app.executed] == ['select']
+    assert json.loads(prefs_file(app_dir).read_text()) == {'flutter.server_selector_country': 'France'}  # писало приложение
+
+
+def test_cli_writes_prefs_when_app_not_running(app_dir, sync, cli):
+    assert not prefs_file(app_dir).exists()
+    sbx.cmd_use(axiom_state(), argparse.Namespace(server='1'))
+    assert json.loads(prefs_file(app_dir).read_text())['flutter.server_selector_country'] == 'France'
+    assert not (sync / 'control.json').exists()
+    with FakeApp(sync, beat=False) as app:
+        app.publish(heartbeat=now_ms() - 60_000)                  # устаревшее сердцебиение = не запущено
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server='2'))
+    assert app.executed == []
+    assert json.loads(prefs_file(app_dir).read_text())['flutter.server_selector_country'] == 'Netherlands'
+
+
+def test_select_sent_with_app_idle(sync, cli):
+    with FakeApp(sync, connected=False) as app:                    # приложение запущено, VPN выключен
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server=None, select='France||'))
+    assert app.executed[0]['selection'] == {'c': 'France', 'p': 'hysteria2', 't': 'hy2'}
+    assert cli['service'] == [] and cli['api'] == []
+
+
+def test_selection_in_memory_for_cli_start(sync, cli, monkeypatch):
+    """После ack выбор виден этому процессу (конфиг CLI строится по нему), хотя файл писало приложение."""
+    st = axiom_state()
+    with FakeApp(sync, connected=False):
+        sbx.cmd_use(st, argparse.Namespace(server='2'))
+    assert sbx.axiom_prefs_now(st['_axiom'])[:1] == ['Netherlands']
+
+
+# ── 5: приложение получает select раньше конфига CLI ──────────────────────
+
+def test_select_sent_before_cli_apply(sync, cli, monkeypatch):
+    def broken(st, reload=True, quiet=False):
+        raise RuntimeError('нет sing-box')
+
+    monkeypatch.setattr(sbx, 'apply', broken)
+    with FakeApp(sync) as app:
+        with pytest.raises(RuntimeError):
+            sbx.cmd_use(axiom_state(), argparse.Namespace(server='1'))
+    assert [c['cmd'] for c in app.executed] == ['select']
+
+
+def test_select_resolved_against_app_menu_without_cli_servers(sync, cli):
+    with FakeApp(sync) as app:
+        sbx.cmd_use(axiom_state(), argparse.Namespace(server=None, select='Netherlands|vless|ws'))
+    assert app.executed[0]['selection'] == {'c': 'Netherlands', 'p': 'vless', 't': 'ws'}
+
+
+# ── 3: start.lock ────────────────────────────────────────────────────────
+
+def test_cli_start_holds_and_removes_lock(monkeypatch, sync, cli):
+    monkeypatch.setattr(sbx, 'show_status', lambda st: None)
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == ['start'] and cli['lock_during'] is True      # лок был во время запуска
+    assert not (sync / 'start.lock').exists()                               # и снят после
+
+
+def test_lock_removed_when_start_fails(monkeypatch, sync, cli):
+    monkeypatch.setattr(sbx, 'cmd_log', lambda *a: None)
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(sbx, 'service_action', lambda action: None)        # движок не поднялся
+    with pytest.raises(SystemExit):
+        sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert not (sync / 'start.lock').exists()
+
+
+def test_lock_payload_and_exclusive(sync):
+    with sbx.start_reservation(sync) as mine:
+        assert mine is True
+        data = json.loads((sync / 'start.lock').read_text())
+        assert data['owner'] == 'cli' and is_uuid(data['id']) and abs(data['ts'] - now_ms()) < 5000
+        with sbx.start_reservation(sync) as second:
+            assert second is False                                          # второй стартер не получает резерв
+        assert (sync / 'start.lock').exists()
+    assert not (sync / 'start.lock').exists()
+
+
+def is_uuid(value):
+    return sbx.is_uuid4(value)
+
+
+def test_app_lock_means_on(sync, cli, capsys):
+    with FakeApp(sync, connected=False) as app:
+        app.hold_start_lock()
+        sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert 'VPN уже включён в приложении AxiOm' in capsys.readouterr().out and cli['service'] == []
+
+
+def test_app_connecting_means_on(sync, cli, capsys):
+    with FakeApp(sync, connected=False, connecting=True):
+        sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+        sbx.cmd_status(axiom_state(), argparse.Namespace(json=True))
+    out = capsys.readouterr().out
+    assert 'уже включён' in out and '"vpn": "on"' in out and cli['service'] == []
+
+
+def test_stale_app_lock_ignored(monkeypatch, sync, cli):
+    monkeypatch.setattr(sbx, 'show_status', lambda st: None)
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    with FakeApp(sync, connected=False) as app:
+        app.hold_start_lock(age_ms=61_000)
+        sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == ['start']
+
+
+def test_cli_does_not_start_when_lock_taken_midway(monkeypatch, sync, cli, capsys):
+    """Приложение успело взять лок после проверки app_vpn_on: CLI свой движок не запускает."""
+    real = sbx.app_vpn_on
+    monkeypatch.setattr(sbx, 'app_vpn_on', lambda sync=None: None)
+    (sync / 'start.lock').write_text(json.dumps({'owner': 'app', 'id': str(uuid.uuid4()), 'ts': now_ms()}))
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == [] and 'запускается' in capsys.readouterr().out
+    assert real is not None
+
+
+def test_down_waits_for_app_start(sync, cli):
+    with FakeApp(sync, connected=False, connecting=True) as app:
+        app.hold_start_lock()
+
+        def finish():
+            time.sleep(0.3)
+            app.connected, app.connecting = True, False
+            app.release_start_lock()
+
+        thread = threading.Thread(target=finish)
+        thread.start()
+        started = time.monotonic()
+        sbx.cmd_down(axiom_state(), argparse.Namespace())
+        thread.join()
+    assert time.monotonic() - started >= 0.25
+    assert [c['cmd'] for c in app.executed] == ['disconnect']             # выключен уже запущенный движок
+
+
+# ── 4: control.lock ──────────────────────────────────────────────────────
+
+def test_control_lock_held_until_ack(sync):
+    seen = []
+
+    def slow_ack():
+        time.sleep(0.2)
+        seen.append((sync / 'control.lock').exists())
+        command = json.loads((sync / 'control.json').read_text())
+        (sync / 'control-ack.json').write_text(json.dumps({'v': 1, 'id': command['id'], 'ok': True, 'ts': now_ms()}))
+
+    thread = threading.Thread(target=slow_ack)
+    thread.start()
+    sbx.send_app_command(sync, 'disconnect')
+    thread.join()
+    assert seen == [True] and not (sync / 'control.lock').exists()
+
+
+def test_control_lock_released_on_timeout(sync, monkeypatch):
+    monkeypatch.setattr(sbx, 'SYNC_ACK_TIMEOUT', 0.2)
+    with pytest.raises(SystemExit):
+        sbx.send_app_command(sync, 'disconnect')
+    assert not (sync / 'control.lock').exists()
+
+
+def test_control_lock_stale_removed_and_serializes(sync):
+    lock = sync / 'control.lock'
+    lock.write_text(json.dumps({'owner': 'cli', 'id': 'x', 'ts': 1}))
+    old = time.time() - 60
+    os.utime(lock, (old, old))
+    with sbx.control_lock(sync):
+        assert lock.exists()
+    assert not lock.exists()
+    order = []
+    with FakeApp(sync, delay=0.15) as app:
+        def sender(tag):
+            sbx.send_app_command(sync, 'select', ('France', 'hysteria2', 'hy2'))
+            order.append(tag)
+
+        threads = [threading.Thread(target=sender, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert len(app.executed) == 2 and len(order) == 2                    # обе команды дошли, ни одна не затёрта
+
+
+def test_fake_app_durable_dedup(sync):
+    command_id = sbx.write_control(sync, 'disconnect')
+    (sync / 'control-ack.json').write_text(json.dumps({'v': 1, 'id': command_id, 'ok': True, 'ts': now_ms()}))
+    with FakeApp(sync) as app:
+        time.sleep(0.2)
+    assert app.executed == []        # уже подтверждённая команда после перезапуска приложения не исполняется
+
+
+# ── 6: валидация на чтении ───────────────────────────────────────────────
+
+@pytest.mark.parametrize('patch', [{'v': 2}, {'v': True}, {'heartbeat': True}, {'heartbeat': '1'},
+                                   {'connected': 'true'}, {'connected': 1}, {'connecting': 'no'},
+                                   {'selection': {'c': 1, 'p': '', 't': ''}}, {'selection': 'x'}])
+def test_invalid_app_state_rejected(sync, patch):
+    doc = {'v': 1, 'heartbeat': now_ms(), 'connected': True, 'connecting': False,
+           'selection': {'c': '__auto__', 'p': '', 't': ''}}
+    (sync / 'app-state.json').write_text(json.dumps(doc))
+    assert sbx.app_state(sync) is not None
+    (sync / 'app-state.json').write_text(json.dumps({**doc, **patch}))
+    assert sbx.app_state(sync) is None
+
+
+@pytest.mark.parametrize('patch', [{'ok': 'false'}, {'ok': 1}, {'v': 2}, {'ts': 'x'}, {'ts': True}])
+def test_invalid_ack_rejected(sync, monkeypatch, patch):
+    monkeypatch.setattr(sbx, 'SYNC_ACK_TIMEOUT', 0.1)
+    command_id = str(uuid.uuid4())
+    (sync / 'control-ack.json').write_text(json.dumps({'v': 1, 'id': command_id, 'ok': True, 'ts': 1, **patch}))
+    assert sbx.wait_ack(sync, command_id) is None
+    (sync / 'control-ack.json').write_text(json.dumps({'v': 1, 'id': command_id, 'ok': True, 'ts': 1}))
+    assert sbx.wait_ack(sync, command_id)['ok'] is True
+    (sync / 'control-ack.json').write_text(json.dumps({'v': 1, 'id': 'not-a-uuid', 'ok': True, 'ts': 1}))
+    assert sbx.wait_ack(sync, 'not-a-uuid') is None                      # id не uuid4 — не годится
+
+
+def test_status_json_canonical_auto(sync, cli, capsys):
+    with FakeApp(sync, selection=('__auto__', 'x', 'y')):
+        sbx.cmd_status(axiom_state(), argparse.Namespace(json=True))
+    assert json.loads(capsys.readouterr().out)['selection'] == {'c': '__auto__', 'p': 'x', 't': 'y'}  # как опубликовало приложение
+
+
+# ── 7: polkit ────────────────────────────────────────────────────────────
+
+def test_polkit_rule_text_and_install(monkeypatch, tmp_path):
+    rule = tmp_path / 'rules.d/50-axiom-cli.rules'
+    monkeypatch.setattr(sbx, 'POLKIT_RULE', rule)
+    monkeypatch.setattr(sbx, 'BASE', 'axiom')
+    monkeypatch.setattr(sbx, 'UNIT', 'axiom.service')
+    monkeypatch.setenv('SUDO_USER', 'alice')
+    text = sbx.polkit_rule_text(sbx.installing_user())
+    assert 'subject.user == "alice"' in text and '"axiom.service"' in text and '"stop"' in text and 'restart' in text
+    written = []
+    monkeypatch.setattr(sbx, 'run', lambda cmd, check=True, **kw: written.append(('run', cmd)))
+    monkeypatch.setattr(sbx, 'is_root', lambda: True)
+
+    def fake_write(path, body):
+        written.append(('write', path, body))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+
+    monkeypatch.setattr(sbx, 'sudo_write', fake_write)
+    assert sbx.install_polkit_rule() is True and rule.read_text() == text
+    assert sbx.install_polkit_rule() is False                            # без изменений — повторно не пишется
+    monkeypatch.setenv('SUDO_USER', 'bad user"; x')
+    with pytest.raises(ValueError):
+        sbx.installing_user()
+
+
+def test_service_action_tries_without_sudo_when_rule_exists(monkeypatch, tmp_path):
+    rule = tmp_path / 'rule'
+    monkeypatch.setattr(sbx, 'POLKIT_RULE', rule)
+    monkeypatch.setattr(sbx, 'IS_WIN', False)
+    monkeypatch.setattr(sbx, 'BASE', 'axiom')
+    calls = []
+
+    def systemctl(*args, sudo=False, check=True, capture=False):
+        calls.append((args, sudo))
+        return subprocess.CompletedProcess(args, 0 if not sudo and len(calls) == 1 and fail[0] is False else 1)
+
+    fail = [False]
+    monkeypatch.setattr(sbx, 'systemctl', systemctl)
+    sbx.service_action('stop')                                           # правила нет — сразу sudo
+    assert calls == [(('stop', sbx.UNIT), True)]
+    calls.clear()
+    rule.write_text('x')
+    sbx.service_action('stop')                                           # правило есть — без sudo, успех
+    assert calls == [(('stop', sbx.UNIT), False)]
+    calls.clear()
+    fail[0] = True
+    sbx.service_action('restart')                                        # без sudo отказ — запасной путь через sudo
+    assert calls == [(('restart', sbx.UNIT), False), (('restart', sbx.UNIT), True)]
+    calls.clear()
+    monkeypatch.setattr(sbx, 'BASE', 'sbx')
+    sbx.service_action('start')                                          # режим sbx не меняется
+    assert calls == [(('start', sbx.UNIT), True)]
+
+
+def test_uninstall_removes_polkit_rule(monkeypatch, tmp_path):
+    rule = tmp_path / 'rule'
+    rule.write_text('x')
+    monkeypatch.setattr(sbx, 'POLKIT_RULE', rule)
+    monkeypatch.setattr(sbx, 'IS_WIN', False)
+    monkeypatch.setattr(sbx, 'BASE', 'axiom')
+    monkeypatch.setattr(sbx, 'UNIT_DIR', tmp_path / 'units')
+    monkeypatch.setattr(sbx, 'require_windows_admin', lambda argv=None: True)
+    commands = []
+    monkeypatch.setattr(sbx, 'run', lambda cmd, check=True, **kw: commands.append(cmd) or subprocess.CompletedProcess(cmd, 0))
+    monkeypatch.setattr(sbx, 'is_root', lambda: True)
+    sbx.cmd_uninstall(axiom_state(), argparse.Namespace())
+    assert ['rm', '-f', str(rule)] in commands
+
+
+def test_install_units_writes_rule_only_in_axiom_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(sbx, 'IS_WIN', False)
+    monkeypatch.setattr(sbx, 'UNIT_DIR', tmp_path / 'units')
+    monkeypatch.setattr(sbx, 'sudo_write', lambda path, text: None)
+    monkeypatch.setattr(sbx, 'systemctl', lambda *a, **k: None)
+    monkeypatch.setattr(sbx, 'unit_text', lambda st: 'u')
+    monkeypatch.setattr(sbx, 'timer_units', lambda: ('s', 't'))
+    monkeypatch.setattr(sbx, 'WORK_DIR', tmp_path / 'work')
+    calls = []
+    monkeypatch.setattr(sbx, 'install_polkit_rule', lambda: calls.append(1) or True)
+    monkeypatch.setattr(sbx, 'BASE', 'sbx')
+    sbx.install_units({}, quiet=True)
+    assert calls == []
+    monkeypatch.setattr(sbx, 'BASE', 'axiom')
+    sbx.install_units({}, quiet=True)
+    assert calls == [1]
+
+
+# ── 8: уже работает ──────────────────────────────────────────────────────
+
+def test_up_with_running_cli_does_not_restart(sync, cli, capsys):
+    cli['active'] = True
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == [] and 'применён без перезапуска' in capsys.readouterr().out
+
+
+def test_connect_select_with_running_cli_applies_only(sync, cli):
+    cli['active'] = True
+    sbx.cmd_connect(axiom_state(), argparse.Namespace(number=None, select='France||', force=False))
+    assert cli['service'] == []
+    assert cli['api'] == [('PUT', '/proxies/proxy', {'name': FRANCE})]
+
+
+# ── 11: перенос профиля старого CLI, отложенная загрузка ─────────────────
+
+def test_old_cli_profile_path_imported(old_cli_dir, capsys):
+    profile = old_cli_dir / 'profiles/subscription.json'
+    profile.write_text(json.dumps({'outbounds': [
+        {'tag': 'Netherlands (Test) [ws] § 0', 'type': 'socks', 'server': 'h.example', 'server_port': 1080}]}))
+    (old_cli_dir / 'state.json').write_text(json.dumps({**OLD_CLI_STATE, 'subscription_url': '',
+                                                        'profile_path': str(profile)}))
+    st = sbx.load_state()
+    assert [s['name'] for s in st['subs']] == ['axiom-local'] and 'pending_fetch' not in st
+    assert st['subs'][0]['local_path'] == str(profile)
+    cached = json.loads((old_cli_dir / 'subs/axiom-local.json').read_text())
+    assert len(cached['servers']) == 1 and capsys.readouterr().err.strip()
+    assert profile.exists()
+
+
+def test_old_cli_profile_path_missing_file_ignored(old_cli_dir):
+    (old_cli_dir / 'state.json').write_text(json.dumps({**OLD_CLI_STATE, 'subscription_url': '',
+                                                        'profile_path': '/nonexistent/subscription.json'}))
+    assert sbx.load_state()['subs'] == []
+
+
+def test_pending_fetch_persists_until_success(monkeypatch, old_cli_dir):
+    (old_cli_dir / 'state.json').write_text(json.dumps(OLD_CLI_STATE))
+    monkeypatch.setattr(sbx, 'load_axiom_context', lambda: {'root': None, 'profiles': [], 'prefs': {}})
+    monkeypatch.setattr(sbx.sys, 'argv', ['axiom'])
+    monkeypatch.setattr(sbx, 'cmd_ls', lambda st, a: None)
+    monkeypatch.setattr(sbx, 'update_rulesets', lambda *a, **k: None)
+    monkeypatch.setattr(sbx, 'cmd_status', lambda st, a: None)
+    online = [False]
+
+    def fetch(st, sub):
+        if not online[0]:
+            raise OSError('нет сети')
+        return ([{'name': 'France (x) [hy2]', 'outbound': SERVERS[0]['outbound']}], [], 0,
+                {'updated': 1, 'format': 'x', 'title': ''})
+
+    monkeypatch.setattr(sbx, 'fetch_sub', fetch)
+    sbx.main(['status'])                                                   # status загрузку не трогает и метку не съедает
+    assert json.loads((old_cli_dir / 'state.json').read_text())['pending_fetch'] == ['axiom']
+    sbx.main(['ls'])                                                       # нет сети — метка остаётся
+    assert json.loads((old_cli_dir / 'state.json').read_text())['pending_fetch'] == ['axiom']
+    online[0] = True
+    sbx.main(['ls'])
+    saved = json.loads((old_cli_dir / 'state.json').read_text())
+    assert 'pending_fetch' not in saved
+    assert json.loads((old_cli_dir / 'subs/axiom.json').read_text())['servers'][0]['name'] == 'France (x) [hy2]'
