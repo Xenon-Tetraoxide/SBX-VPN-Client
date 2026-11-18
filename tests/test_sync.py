@@ -900,74 +900,110 @@ def test_status_json_canonical_auto(sync, cli, capsys):
 
 # ── 7: polkit ────────────────────────────────────────────────────────────
 
+def deny_rules_dir(monkeypatch, rule):
+    """/etc/polkit-1/rules.d недоступен обычному пользователю: любая проверка этого пути — PermissionError."""
+    real_exists, real_read = Path.exists, Path.read_text
+
+    def exists(self, *a, **k):
+        if self == rule:
+            raise PermissionError(13, 'нет доступа')
+        return real_exists(self, *a, **k)
+
+    def read_text(self, *a, **k):
+        if self == rule:
+            raise PermissionError(13, 'нет доступа')
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(Path, 'exists', exists)
+    monkeypatch.setattr(Path, 'read_text', read_text)
+
+
 def test_polkit_rule_text_and_install(monkeypatch, tmp_path):
     rule = tmp_path / 'rules.d/50-axiom-cli.rules'
     monkeypatch.setattr(sbx, 'POLKIT_RULE', rule)
     monkeypatch.setattr(sbx, 'BASE', 'axiom')
     monkeypatch.setattr(sbx, 'UNIT', 'axiom.service')
     monkeypatch.setenv('SUDO_USER', 'alice')
+    deny_rules_dir(monkeypatch, rule)
     text = sbx.polkit_rule_text(sbx.installing_user())
     assert 'subject.user == "alice"' in text and '"axiom.service"' in text and '"stop"' in text and 'restart' in text
     written = []
     monkeypatch.setattr(sbx, 'run', lambda cmd, check=True, **kw: written.append(('run', cmd)))
     monkeypatch.setattr(sbx, 'is_root', lambda: True)
-
-    def fake_write(path, body):
-        written.append(('write', path, body))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body)
-
-    monkeypatch.setattr(sbx, 'sudo_write', fake_write)
-    assert sbx.install_polkit_rule() is True and rule.read_text() == text
-    assert sbx.install_polkit_rule() is False                            # без изменений — повторно не пишется
+    monkeypatch.setattr(sbx, 'sudo_write', lambda path, body: written.append(('write', path, body)))
+    assert sbx.install_polkit_rule() is True
+    assert ('write', rule, text) in written
+    marker = json.loads(sbx.polkit_marker_file().read_text())
+    assert marker['hash'] == __import__('hashlib').sha256(text.encode()).hexdigest()
+    written.clear()
+    assert sbx.install_polkit_rule() is False and written == []           # хеш совпал — не переписывается
+    monkeypatch.setenv('SUDO_USER', 'bob')                                 # правило изменилось — переписывается через sudo
+    assert sbx.install_polkit_rule() is True and any(w[0] == 'write' for w in written)
     monkeypatch.setenv('SUDO_USER', 'bad user"; x')
     with pytest.raises(ValueError):
         sbx.installing_user()
 
-
-def test_service_action_tries_without_sudo_when_rule_exists(monkeypatch, tmp_path):
+def test_service_action_tries_without_sudo_when_marker_says_installed(monkeypatch, tmp_path):
     rule = tmp_path / 'rule'
     monkeypatch.setattr(sbx, 'POLKIT_RULE', rule)
     monkeypatch.setattr(sbx, 'IS_WIN', False)
     monkeypatch.setattr(sbx, 'BASE', 'axiom')
+    deny_rules_dir(monkeypatch, rule)                                      # путь правила не трогаем ни при каких условиях
     calls = []
+    fail = [False]
 
     def systemctl(*args, sudo=False, check=True, capture=False):
         calls.append((args, sudo))
-        return subprocess.CompletedProcess(args, 0 if not sudo and len(calls) == 1 and fail[0] is False else 1)
+        return subprocess.CompletedProcess(args, 1 if sudo or fail[0] else 0)
 
-    fail = [False]
     monkeypatch.setattr(sbx, 'systemctl', systemctl)
-    sbx.service_action('stop')                                           # правила нет — сразу sudo
+    sbx.service_action('stop')                                             # отметки нет — сразу sudo
     assert calls == [(('stop', sbx.UNIT), True)]
     calls.clear()
-    rule.write_text('x')
-    sbx.service_action('stop')                                           # правило есть — без sudo, успех
+    sbx.polkit_marker_file().parent.mkdir(parents=True, exist_ok=True)
+    sbx.polkit_marker_file().write_text(json.dumps({'hash': 'x'}))
+    sbx.service_action('stop')                                             # отметка есть — без sudo, успех
     assert calls == [(('stop', sbx.UNIT), False)]
     calls.clear()
     fail[0] = True
-    sbx.service_action('restart')                                        # без sudo отказ — запасной путь через sudo
+    sbx.service_action('restart')                                          # отказ без sudo (аутентификация) — через sudo
     assert calls == [(('restart', sbx.UNIT), False), (('restart', sbx.UNIT), True)]
     calls.clear()
     monkeypatch.setattr(sbx, 'BASE', 'sbx')
-    sbx.service_action('start')                                          # режим sbx не меняется
+    sbx.service_action('start')                                            # режим sbx не меняется
     assert calls == [(('start', sbx.UNIT), True)]
 
 
+def test_polkit_marker_unreadable_means_unknown(monkeypatch, tmp_path):
+    marker = sbx.polkit_marker_file()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({'hash': 'x'}))
+    real = Path.read_text
+
+    def read_text(self, *a, **k):
+        if self == marker:
+            raise PermissionError(13, 'нет доступа')
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, 'read_text', read_text)
+    assert sbx.polkit_marker() is None
+
 def test_uninstall_removes_polkit_rule(monkeypatch, tmp_path):
     rule = tmp_path / 'rule'
-    rule.write_text('x')
     monkeypatch.setattr(sbx, 'POLKIT_RULE', rule)
     monkeypatch.setattr(sbx, 'IS_WIN', False)
     monkeypatch.setattr(sbx, 'BASE', 'axiom')
     monkeypatch.setattr(sbx, 'UNIT_DIR', tmp_path / 'units')
     monkeypatch.setattr(sbx, 'require_windows_admin', lambda argv=None: True)
+    deny_rules_dir(monkeypatch, rule)
     commands = []
     monkeypatch.setattr(sbx, 'run', lambda cmd, check=True, **kw: commands.append(cmd) or subprocess.CompletedProcess(cmd, 0))
     monkeypatch.setattr(sbx, 'is_root', lambda: True)
     sbx.cmd_uninstall(axiom_state(), argparse.Namespace())
-    assert ['rm', '-f', str(rule)] in commands
-
+    assert ['rm', '-f', str(rule)] not in commands                         # отметки нет — правило не трогаем
+    sbx.polkit_marker_file().write_text(json.dumps({'hash': 'x'}))
+    sbx.cmd_uninstall(axiom_state(), argparse.Namespace())
+    assert ['rm', '-f', str(rule)] in commands and not sbx.polkit_marker_file().exists()
 
 def test_install_units_writes_rule_only_in_axiom_mode(monkeypatch, tmp_path):
     monkeypatch.setattr(sbx, 'IS_WIN', False)

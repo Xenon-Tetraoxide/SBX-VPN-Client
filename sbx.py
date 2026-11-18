@@ -2834,19 +2834,35 @@ def installing_user():
     return user
 
 
+def polkit_marker_file():
+    return CONF_DIR / "polkit-rule.json"
+
+
+def polkit_marker():
+    """Отметка «правило поставлено через sudo» (хеш текста) в каталоге CLI; /etc/polkit-1/rules.d недоступен без root."""
+    try:
+        data = json.loads(polkit_marker_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):     # PermissionError — «неизвестно»
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get("hash"), str) else None
+
+
 def install_polkit_rule():
-    """AxiOm: правило polkit, чтобы приложение и CLI без пароля запускали/останавливали axiom.service."""
+    """AxiOm: правило polkit (через sudo), чтобы приложение и CLI без пароля запускали/останавливали axiom.service."""
     text = polkit_rule_text(installing_user())
-    if not POLKIT_RULE.exists() or POLKIT_RULE.read_text() != text:
-        run(sudo_cmd("mkdir", "-p", str(POLKIT_RULE.parent)))
-        sudo_write(POLKIT_RULE, text)
-        return True
-    return False
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    marker = polkit_marker()
+    if marker and marker["hash"] == digest:
+        return False
+    run(sudo_cmd("mkdir", "-p", str(POLKIT_RULE.parent)))
+    sudo_write(POLKIT_RULE, text)
+    write_private(polkit_marker_file(), json.dumps({"hash": digest, "path": str(POLKIT_RULE)}))
+    return True
 
 
 def service_action(action):
     if not IS_WIN:
-        if BASE == "axiom" and POLKIT_RULE.exists():
+        if BASE == "axiom" and polkit_marker():
             if systemctl(action, UNIT, check=False, capture=True).returncode == 0:
                 return      # правило polkit сработало без sudo
         systemctl(action, UNIT, sudo=True)
@@ -4224,8 +4240,9 @@ def cmd_uninstall(st, a):
         for name in present:
             attempt(f"удаление {name}", sudo_cmd("rm", "-f", str(UNIT_DIR / name)))
         attempt("daemon-reload", sudo_cmd("systemctl", "daemon-reload"))
-    if BASE == "axiom" and POLKIT_RULE.exists():
-        attempt("удаление правила polkit", sudo_cmd("rm", "-f", str(POLKIT_RULE)))
+    if BASE == "axiom" and polkit_marker():
+        if attempt("удаление правила polkit", sudo_cmd("rm", "-f", str(POLKIT_RULE))).returncode == 0:
+            polkit_marker_file().unlink(missing_ok=True)
     if failures:
         die("не удалось выполнить: " + ", ".join(failures))
     print(f"✓ юниты удалены; подписки и настройки остались в {CONF_DIR}" if present
