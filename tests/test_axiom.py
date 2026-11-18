@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import sqlite3
+import subprocess
 import uuid
 from contextlib import closing
 from email.message import Message
@@ -192,6 +193,7 @@ def test_legacy_dispatch(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(sbx.sys, 'argv', ['axiom.exe'])
     monkeypatch.setattr(sbx, 'load_axiom_context', lambda: {'root': None, 'profiles': []})
     monkeypatch.setattr(sbx, 'interactive', lambda: False)
+    monkeypatch.setattr(sbx, 'run', lambda cmd, check=True, **kw: subprocess.CompletedProcess(cmd, 0, 'inactive\n', ''))
     calls = []
     monkeypatch.setattr(sbx, 'cmd_sub', lambda st, args: calls.append((args.action, args.name, args.url)))
     monkeypatch.setattr(sbx, 'cmd_use', lambda st, args: calls.append(('use', args.server)))

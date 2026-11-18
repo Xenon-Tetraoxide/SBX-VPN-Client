@@ -683,3 +683,64 @@ def test_elevated_interactive_flag_needs_elevation_and_is_recorded(monkeypatch):
     assert sbx.PARENT_INTERACTIVE is False
     with pytest.raises(SystemExit):
         sbx.take_elevated_prefix(['--elevated-interactive', '1', 'up'])
+
+
+# Fourth round
+
+def test_rm_keeps_selection_on_the_same_record_among_duplicate_names(monkeypatch):
+    st = state()
+    st['manual'] = [{'name': 'Dup', 'outbound': {**outbound('Dup'), 'server': f'h{i}.example'}} for i in range(3)]
+    tags = [s['tag'] for s in sbx.all_servers(st)]
+    st['selected'] = tags[1]                      # второй
+    chosen_outbound = st['manual'][1]['outbound']
+    monkeypatch.setattr(sbx, 'apply', lambda *a, **k: None)
+    monkeypatch.setattr(sbx, 'save_state', lambda s: None)
+    sbx.cmd_rm(st, argparse.Namespace(server='1'))   # удаляем первый
+    servers = sbx.all_servers(st)
+    selected = next(s for s in servers if s['tag'] == st['selected'])
+    assert selected['outbound'] is chosen_outbound   # выбор остался на той же записи
+    sbx.cmd_rm(st, argparse.Namespace(server=str(1 + [s['tag'] for s in servers].index(st['selected']))))
+    assert st['selected'] == 'auto'                   # удалили выбранный
+
+
+def test_old_cache_without_version_is_invalid(monkeypatch, app_directory):
+    row, path, document = app_with_profile(app_directory, NETHERLANDS)
+    monkeypatch.setattr(sbx.urllib.request, 'urlopen', lambda request, **kw: response(
+        document, subscription_userinfo='upload=1; download=2; total=3'))
+    app = sbx.load_axiom_context()
+    sbx.update_app_profiles(app, app['profiles'], quiet=True)
+    file = sbx.app_cache_file(app, row['id'])
+    assert sbx.read_app_cache(app, app['profiles'][0])
+    cache = json.loads(file.read_text())
+    del cache['version']
+    file.write_text(json.dumps(cache))
+    assert sbx.read_app_cache(app, app['profiles'][0]) is None
+    cache['version'] = sbx.APP_CACHE_VERSION - 1
+    file.write_text(json.dumps(cache))
+    assert sbx.read_app_cache(app, app['profiles'][0]) is None
+
+
+@pytest.mark.parametrize('windows_host', [False, True])
+def test_install_restarts_a_running_service_and_respects_the_guard(monkeypatch, windows_host):
+    monkeypatch.setattr(sbx, 'IS_WIN', windows_host)
+    monkeypatch.setattr(sbx, 'windows_admin', lambda: True)
+    monkeypatch.setattr(sbx, 'is_active', lambda st: True)
+    monkeypatch.setattr(sbx, 'task_running', lambda name=None: True)
+    monkeypatch.setattr(sbx, 'other_brand_active', lambda: None)
+    events = []
+    monkeypatch.setattr(sbx, 'prepare_service', lambda st: events.append('prepare'))
+    monkeypatch.setattr(sbx, 'service_action', lambda action: events.append(action))
+    sbx.cmd_install(state(), argparse.Namespace(force=False))
+    assert events == ['prepare', 'restart']
+    monkeypatch.setattr(sbx, 'is_active', lambda st: False)
+    monkeypatch.setattr(sbx, 'task_running', lambda name=None: False)
+    events.clear()
+    sbx.cmd_install(state(), argparse.Namespace(force=False))
+    assert events == ['prepare']                      # остановленную службу не запускаем
+    monkeypatch.setattr(sbx, 'is_active', lambda st: True)
+    monkeypatch.setattr(sbx, 'task_running', lambda name=None: True)
+    monkeypatch.setattr(sbx, 'other_brand_active', lambda: {'name': 'axiom', 'tun': True, 'listeners': {}})
+    events.clear()
+    with pytest.raises(SystemExit):
+        sbx.cmd_install(state(), argparse.Namespace(force=False))
+    assert events == []

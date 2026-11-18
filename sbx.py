@@ -1208,6 +1208,9 @@ def app_db_key(app):
     return hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
 
 
+APP_CACHE_VERSION = 2   # 2: группа сохраняется в порядке действующего ранга (1.3.0)
+
+
 def app_cache_file(app, profile_id):
     """Кэш sbx для профиля приложения: каталог отдельно от подписок sbx, поэтому с их именами не пересекается."""
     if str(uuid.UUID(profile_id)) != profile_id.lower():
@@ -1227,7 +1230,7 @@ def config_stamp(app, profile_id):
 def write_app_cache(app, profile_id, config, group, row_last_update):
     """Кэш sbx: свежий список, состав и порядок группы приложения, собственное время обновления sbx."""
     write_private(app_cache_file(app, profile_id), json.dumps({
-        "config": config, "group": group, "refreshed": int(time.time()),
+        "version": APP_CACHE_VERSION, "config": config, "group": group, "refreshed": int(time.time()),
         "row_last_update": row_last_update, "config_stamp": config_stamp(app, profile_id)},
         ensure_ascii=False))
 
@@ -1237,7 +1240,7 @@ def read_app_cache(app, row):
     try:
         cache = json.loads(app_cache_file(app, row["id"]).read_text(encoding="utf-8"))
         group = cache["group"]
-        if (cache["row_last_update"] == row.get("last_update") and isinstance(cache["config"], str)
+        if (cache["version"] == APP_CACHE_VERSION and cache["row_last_update"] == row.get("last_update") and isinstance(cache["config"], str)
                 and cache["config_stamp"] == config_stamp(app, row["id"]) and isinstance(cache["refreshed"], int)
                 and (group is None or isinstance(group, list) and all(isinstance(tag, str) for tag in group))):
             return cache
@@ -2500,7 +2503,28 @@ def cmd_rm(st, a):
     index = server.get("manual_index")
     if index is None:
         die(f"{server['tag']} пришёл из подписки — удаляется только вместе с ней (или auto_exclude)")
+    # выбор хранится тегом, а теги одноимённых ручных серверов сдвигаются при удалении: следим по записи
+    servers = all_servers(st)
+    chosen = next((s for s in servers if s["tag"] == st["selected"]), None)
+    extra = st["axiom_extra"] if isinstance(st.get("axiom_extra"), dict) else None
+    extra_record = next((s for s in servers if extra and s["tag"] == extra.get("tag")), None)
     del st["manual"][index]   # именно запись под этим номером, а не однофамилец по имени
+    after = {s["manual_index"]: s["tag"] for s in all_servers(st) if "manual_index" in s}
+
+    def new_tag(record):
+        """Тег записи после удаления: None — не менялся, "" — запись удалена."""
+        i = record.get("manual_index")
+        if i is None:
+            return None
+        return "" if i == index else after[i - (i > index)]
+
+    if chosen is not None and (tag := new_tag(chosen)) is not None:
+        st["selected"] = tag or "auto"
+    if extra_record is not None and (tag := new_tag(extra_record)) is not None:
+        if tag:
+            extra["tag"] = tag
+        else:
+            st.pop("axiom_extra")
     save_state(st)
     apply(st)
     print(f"✓ удалён {server['tag']}")
@@ -3256,9 +3280,13 @@ def cmd_log(st, a):
 
 
 def cmd_enable(st, a):
+    was_running = service_running(st)
+    if was_running:
+        refuse_other_brand(st, False)
     if not require_windows_admin():
         return
     prepare_service(st)
+    restart_if_was_running(st, was_running)
     if IS_WIN:
         register_windows_service(True)
         task_call("change", UPDATE, "/enable", capture=False)
@@ -3503,10 +3531,25 @@ def cmd_rule(st, a):
     print(f"✓ {', '.join(doms)} — {where}")
 
 
+def service_running(st):
+    return task_running() if IS_WIN else is_active(st)
+
+
+def restart_if_was_running(st, was_running):
+    """install/enable переписывают конфиг службы без перезагрузки: работающему движку нужен перезапуск."""
+    if was_running:
+        service_action("restart")
+        print("↻ служба перезапущена с новым конфигом")
+
+
 def cmd_install(st, a):
-    if not require_windows_admin():
+    was_running = service_running(st)
+    if was_running:
+        refuse_other_brand(st, getattr(a, "force", False))   # перезапуск запустит движок с новым режимом
+    if not require_windows_admin(["install", *(["--force"] if getattr(a, "force", False) else [])]):
         return
     prepare_service(st)
+    restart_if_was_running(st, was_running)
 
 
 def cmd_uninstall(st, a):
@@ -3851,7 +3894,9 @@ def run_cli(argv):
     x = sp.add_parser("config", help="проверить сгенерированный конфиг")
     x.add_argument("--show", action="store_true", help="напечатать (там ключи!)")
     x.set_defaults(func=cmd_config)
-    sp.add_parser("install", help="(пере)установить службу или задачи").set_defaults(func=cmd_install)
+    x = sp.add_parser("install", help="(пере)установить службу или задачи; работающую — перезапустить")
+    x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
+    x.set_defaults(func=cmd_install)
     sp.add_parser("uninstall", help="удалить службу или задачи, данные оставить").set_defaults(func=cmd_uninstall)
 
     a = p.parse_args(argv)
