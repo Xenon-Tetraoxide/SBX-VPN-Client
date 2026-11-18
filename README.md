@@ -274,6 +274,9 @@ systemd не сдаётся.
 `sbx restart` (UAC).
 `bypass_sports`, `bypass_users` и `before_units` в Windows не применяются.
 
+Если VPN уже работает, `sbx install` и `sbx enable` перезапускают его, чтобы движок сразу
+работал с новым конфигом: связь прервётся на пару секунд. Остановленный VPN они не запускают.
+
 ## Известные особенности
 
 - TUN-стек — **gvisor**. Стек `system`/`mixed` принимает TCP через input-цепочку ядра
