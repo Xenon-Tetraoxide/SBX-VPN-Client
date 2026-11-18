@@ -42,6 +42,7 @@ def app_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(sbx, 'all_servers', lambda st: SERVERS)
     monkeypatch.setattr(sbx, 'SYNC_ACK_TIMEOUT', 1.5)
     monkeypatch.setattr(sbx, 'SYNC_POLL', 0.02)
+    monkeypatch.setattr(sbx, 'START_READY_TIMEOUT', 0.3)
     (directory / 'cli-sync').mkdir()
     return directory
 
@@ -1131,7 +1132,7 @@ def test_intent_written_by_up_down_restart_connect(monkeypatch, sync, cli):
     assert first['want'] == 'on' and first['by'] == 'cli' and sbx.is_uuid4(first['id']) and first['v'] == 1
     sbx.cmd_down(axiom_state(), argparse.Namespace())
     off = intent(sync)
-    assert off['want'] == 'off' and off['ts'] > first['ts'] and off['id'] != first['id']
+    assert off['want'] == 'off' and off['seq'] == first['seq'] + 1 and off['id'] != first['id']
     sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
     assert intent(sync)['want'] == 'on'
     sbx.cmd_down(axiom_state(), argparse.Namespace())
@@ -1140,12 +1141,12 @@ def test_intent_written_by_up_down_restart_connect(monkeypatch, sync, cli):
 
 
 def test_intent_ts_strictly_increases(sync):
-    stamps = [sbx.write_intent(sync, 'on' if i % 2 else 'off')['ts'] for i in range(5)]
-    assert stamps == sorted(set(stamps))
+    stamps = [sbx.write_intent(sync, 'on' if i % 2 else 'off')['seq'] for i in range(5)]
+    assert stamps == [1, 2, 3, 4, 5]
     assert sbx.write_intent(sync / 'missing-dir', 'on') is None             # нет каталога приложения — ничего не пишется
 
 
-@pytest.mark.parametrize('patch', [{'want': 'maybe'}, {'by': 'x'}, {'id': 'nope'}, {'ts': 'now'}, {'v': 2}])
+@pytest.mark.parametrize('patch', [{'want': 'maybe'}, {'by': 'x'}, {'id': 'nope'}, {'ts': 'now'}, {'v': 2}, {'seq': '1'}, {'seq': True}])
 def test_invalid_intent_ignored(sync, patch):
     doc = sbx.write_intent(sync, 'off')
     (sync / 'vpn-intent.json').write_text(json.dumps({**doc, **patch}))
@@ -1294,3 +1295,128 @@ def test_restart_sbx_mode_unchanged(monkeypatch, sync, cli):
     monkeypatch.setattr(sbx, 'BASE', 'sbx')
     sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
     assert cli['service'] == ['restart'] and not (sync / 'vpn-intent.json').exists()
+
+
+# ══ v5: seq под intent.lock, одно намерение на действие, замок до готовности ═══
+
+WRITER = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import sbx
+from pathlib import Path
+sync = Path(sys.argv[2])
+for i in range(int(sys.argv[3])):
+    print(sbx.write_intent(sync, 'on' if (i + int(sys.argv[4])) % 2 else 'off', by=sys.argv[5])['seq'], flush=True)
+"""
+
+
+def test_concurrent_intent_writers_get_strict_seq(sync):
+    procs = [subprocess.Popen([sys.executable, '-c', WRITER, str(Path(sbx.__file__).parent), str(sync), '8', str(i),
+                               'cli' if i % 2 else 'app'], stdout=subprocess.PIPE, text=True) for i in range(5)]
+    seqs = []
+    for proc in procs:
+        out, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 0
+        seqs += [int(x) for x in out.split()]
+    assert sorted(seqs) == list(range(1, 41))                  # ни одного повтора и пропуска при гонке процессов
+    assert sbx.read_intent(sync)['seq'] == 40
+    assert (sync / 'intent.lock').exists()
+
+
+def test_off_with_same_millisecond_still_cancels(monkeypatch, sync, cli):
+    monkeypatch.setattr(sbx.time, 'time', lambda: 1_700_000_000.0)          # одинаковый ts у ON и OFF — решает seq
+    on = sbx.write_intent(sync, 'on')
+    sbx.write_intent(sync, 'off', by='app')
+    assert sbx.intent_cancelled(sync, on) is True
+
+
+def test_delayed_disconnect_with_older_intent_is_noop(sync, cli, capsys):
+    with FakeApp(sync) as app:
+        off = sbx.write_intent(sync, 'off', by='app')                        # приложение записало OFF и замешкалось
+        newer_on = sbx.write_intent(sync, 'on')                              # за это время пользователь включил
+        before = sbx.read_intent(sync)
+        sbx.cmd_down(axiom_state(), argparse.Namespace(intent=f"{off['id']}:{off['seq']}"))
+    assert cli['service'] == [] and app.executed == []                       # ничего не остановлено
+    assert sbx.read_intent(sync) == before and before['id'] == newer_on['id']   # и нового намерения не записано
+    assert 'пропущено' in capsys.readouterr().out
+
+
+def test_disconnect_with_current_intent_stops_without_new_write(sync, cli):
+    cli['active'] = True
+    off = sbx.write_intent(sync, 'off', by='app')
+    sbx.cmd_down(axiom_state(), argparse.Namespace(intent=f"{off['id']}:{off['seq']}"))
+    assert cli['service'] == ['stop'] and sbx.read_intent(sync) == off
+
+
+def test_hidden_intent_flag_parsed_by_main(monkeypatch, sync, cli, tmp_path):
+    monkeypatch.setattr(sbx, 'CONF_DIR', tmp_path / 'c')
+    monkeypatch.setattr(sbx, 'STATE_FILE', tmp_path / 'c/state.json')
+    monkeypatch.setattr(sbx, 'SUBS_DIR', tmp_path / 'c/subs')
+    monkeypatch.setattr(sbx.sys, 'argv', ['axiom'])
+    cli['active'] = True
+    off = sbx.write_intent(sync, 'off', by='app')
+    sbx.main(['disconnect', '--intent', f"{off['id']}:{off['seq']}"])
+    assert cli['service'] == ['stop'] and sbx.read_intent(sync) == off
+    with pytest.raises(SystemExit):
+        sbx.main(['disconnect', '--intent', 'garbage'])
+
+
+def test_elevated_child_gets_intent_and_never_writes(monkeypatch, sync, cli):
+    captured = []
+    monkeypatch.setattr(sbx, 'require_windows_admin', lambda argv=None: captured.append(argv) or False)
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    written = sbx.read_intent(sync)
+    assert captured[0] == ['up', '--intent', f"{written['id']}:{written['seq']}"]
+    monkeypatch.setattr(sbx, 'require_windows_admin', lambda argv=None: True)
+    monkeypatch.setattr(sbx, 'show_status', lambda st: None)
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False, intent=f"{written['id']}:{written['seq']}"))
+    assert sbx.read_intent(sync) == written and cli['service'] == ['start']   # потомок новое намерение не пишет
+
+
+def test_off_during_unelevated_wait_cancels_child(monkeypatch, sync, cli, capsys):
+    """OFF пришёл, пока родитель ждал UAC: потомок с переданным намерением не затирает его новым ON и отменяется."""
+    on = sbx.write_intent(sync, 'on')
+    other_off(sync)
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False, intent=f"{on['id']}:{on['seq']}"))
+    assert cli['service'] == [] and 'отменён' in capsys.readouterr().out
+
+
+def test_off_during_select_ack_wait_cancels_connect(monkeypatch, sync, cli, capsys):
+    """connect --select ждёт ack выбора; за это время OFF — свежий ON после ожидания не создаётся, запуска нет."""
+    with FakeApp(sync, connected=False, delay=0.4) as app:
+        timer = threading.Timer(0.15, other_off, args=(sync,))
+        timer.start()
+        sbx.cmd_connect(axiom_state(), argparse.Namespace(number=None, select='France||', force=False))
+        timer.join()
+    assert cli['service'] == [] and 'отменён' in capsys.readouterr().out
+    assert sbx.read_intent(sync)['want'] == 'off'
+
+
+def test_restart_holds_lock_until_engine_answers(monkeypatch, sync, cli):
+    """Как задача Windows: /run принят, API ответит позже; замок держится до ответа (V)."""
+    lock_state = []
+    answers = iter([False, False, False, True])
+
+    def api_up(st, port=None):
+        lock_state.append(sbx.lock_held_by_other(sync / 'start.lock'))
+        return next(answers, True)
+
+    monkeypatch.setattr(sbx, 'api_up', api_up)
+    monkeypatch.setattr(sbx, 'service_action', lambda action: cli['service'].append(action))
+    monkeypatch.setattr(sbx.time, 'sleep', lambda s: None)
+    sbx.cmd_restart(axiom_state(), argparse.Namespace(force=False))
+    assert cli['service'] == ['restart'] and len(lock_state) >= 4 and all(lock_state)
+    assert not sbx.lock_held_by_other(sync / 'start.lock')
+
+
+def test_ready_timeout_releases_lock_and_reports(monkeypatch, sync, cli, capsys):
+    monkeypatch.setattr(sbx, 'api_up', lambda st, port=None: False)
+    started = []
+    monkeypatch.setattr(sbx, 'is_active', lambda st: bool(started))           # служба жива после старта, API молчит
+    monkeypatch.setattr(sbx, 'service_action', lambda action: started.append(action))
+    monkeypatch.setattr(sbx, 'START_READY_TIMEOUT', 0.1)
+    monkeypatch.setattr(sbx, 'show_status', lambda st: None)
+    monkeypatch.setattr(sbx, 'BASE', 'axiom')
+    sbx.cmd_up(axiom_state(), argparse.Namespace(force=False))
+    assert 'API не ответил' in capsys.readouterr().err
+    assert not sbx.lock_held_by_other(sync / 'start.lock')

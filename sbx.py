@@ -1867,6 +1867,7 @@ SYNC_ACK_TIMEOUT = 15.0     # сколько ждать control-ack.json
 SYNC_POLL = 0.2
 CONTROL_LOCK_WAIT = 20.0    # сколько ждать чужую команду к приложению
 START_LOCK_POLL = 5         # попыток (по 0.1 с) взять start.lock: чужая проба держит его мгновение
+START_READY_TIMEOUT = 30.0   # сколько держать start.lock до ответа движка
 START_WAIT = 60.0           # сколько ждать чужого запуска перед отключением
 
 
@@ -2064,32 +2065,78 @@ def control_lock(sync):
         unlock(handle)
 
 
+INTENT_LOCK_WAIT = 10.0
+
+
 def read_intent(sync):
     data = read_sync_json(sync / "vpn-intent.json") if sync else None
     if (data and is_v1(data.get("v")) and data.get("want") in ("on", "off") and is_uuid4(data.get("id"))
-            and is_int(data.get("ts")) and data.get("by") in ("app", "cli")):
+            and is_int(data.get("ts")) and is_int(data.get("seq")) and data.get("by") in ("app", "cli")):
         return data
     return None
 
 
 def write_intent(sync, want, by="cli"):
-    """vpn-intent.json: последнее намерение пользователя (последний писатель побеждает); ts строго растёт."""
+    """vpn-intent.json: последнее намерение пользователя. Запись под замком intent.lock: прочитать seq, записать seq+1.
+
+    Порядок задаёт только seq (строго растёт); ts — справочно.
+    """
     if not sync or not sync.is_dir():
         return None
-    previous = read_intent(sync)
-    now = int(time.time() * 1000)
-    intent = {"v": 1, "want": want, "id": str(uuid.uuid4()), "ts": max(now, previous["ts"] + 1 if previous else 0),
-              "by": by}
-    write_private(sync / "vpn-intent.json", json.dumps(intent))
+    deadline = time.monotonic() + INTENT_LOCK_WAIT
+    while True:
+        handle = try_lock(sync / "intent.lock")
+        if handle:
+            break
+        if time.monotonic() >= deadline:
+            raise SyncLockError("intent.lock занят дольше 10 с")
+        time.sleep(0.02)
+    try:
+        previous = read_intent(sync)
+        intent = {"v": 1, "want": want, "id": str(uuid.uuid4()), "ts": int(time.time() * 1000),
+                  "seq": previous["seq"] + 1 if previous else 1, "by": by}
+        write_private(sync / "vpn-intent.json", json.dumps(intent))
+    finally:
+        unlock(handle)
     return intent
 
 
+def parse_intent_arg(text):
+    """Скрытый флаг --intent ID:SEQ -> {"id","seq"} (намерение уже записано вызвавшей стороной)."""
+    ident, _, seq = (text or "").partition(":")
+    if not is_uuid4(ident) or not seq.isdigit():
+        die("--intent: нужен вид UUID:SEQ")
+    return {"id": ident, "seq": int(seq)}
+
+
+def intent_for(sync, a, want):
+    """Одно намерение на действие пользователя: переданное (--intent / от родителя) или новая запись."""
+    given = getattr(a, "intent_state", None)
+    if given:
+        return given
+    if getattr(a, "intent", None):
+        return parse_intent_arg(a.intent)
+    return write_intent(sync, want)
+
+
+def intent_args(mine):
+    return ["--intent", f"{mine['id']}:{mine['seq']}"] if mine else []
+
+
 def intent_cancelled(sync, mine):
-    """Появилось более новое намерение (в т. ч. OFF) после нашего ON — запуск надо отменить."""
-    if not mine:
+    """После нашего ON пришло более новое OFF (seq больше) — запуск надо отменить."""
+    if not mine or not sync:
         return False
     current = read_intent(sync)
-    return bool(current and current["id"] != mine["id"] and current["ts"] > mine["ts"])
+    return bool(current and current["seq"] > mine["seq"] and current["want"] == "off")
+
+
+def intent_superseded(sync, mine):
+    """Есть более новое намерение любого рода (для OFF: свежий ON отменяет запоздавший OFF)."""
+    if not mine or not sync:
+        return False
+    current = read_intent(sync)
+    return bool(current and current["seq"] > mine["seq"])
 
 
 def write_control(sync, cmd, selection=None):
@@ -3738,22 +3785,24 @@ def coordinated_start(st, sync, mine, action, *, wait_ready):
             print(CANCELLED_MESSAGE)
             return False
         service_action(action)
-        if wait_ready:
-            time.sleep(1.5)
-            if IS_WIN:
-                for _ in range(20):
-                    if is_active(st):
-                        break
-                    time.sleep(0.25)
-            if not is_active(st):
-                cmd_log(st, argparse.Namespace(lines=30, follow=False, replace=False))
-                die("sing-box не запустился")
+        if wait_ready:     # замок держится, пока движок не ответит (/version clash API), не дольше 30 с
+            deadline = time.monotonic() + START_READY_TIMEOUT
+            while not api_up(st) and time.monotonic() < deadline:
+                time.sleep(0.25)
+            if not api_up(st):
+                if not is_active(st):
+                    cmd_log(st, argparse.Namespace(lines=30, follow=False, replace=False))
+                    die("sing-box не запустился")
+                warn(f"sing-box запущен, но API не ответил за {START_READY_TIMEOUT:g} с; замок запуска отпущен")
     return True
 
 
 def cmd_up(st, a):
     sync = sync_dir()
-    mine = write_intent(sync, "on")
+    mine = intent_for(sync, a, "on")
+    if intent_cancelled(sync, mine):
+        print(CANCELLED_MESSAGE)
+        return
     if sync and app_vpn_on(sync):
         print(APP_ON_MESSAGE)
         return
@@ -3761,7 +3810,10 @@ def cmd_up(st, a):
         print("VPN уже включён (CLI); выбор, если он был, применён без перезапуска")
         return
     refuse_other_brand(st, a.force)
-    if not require_windows_admin(["up", *(["--force"] if a.force else [])]):
+    if not require_windows_admin(["up", *(["--force"] if a.force else []), *intent_args(mine)]):
+        return
+    if intent_cancelled(sync, mine):                       # пока шёл UAC
+        print(CANCELLED_MESSAGE)
         return
     others = foreign_tun()
     if others and not a.force:
@@ -3776,15 +3828,27 @@ def cmd_up(st, a):
 
 def cmd_down(st, a):
     sync = sync_dir()
-    write_intent(sync, "off")                 # сначала намерение: идущий запуск увидит его и отменится
+    if getattr(a, "intent", None):        # OFF уже записан вызвавшей стороной (приложение, родитель до UAC)
+        mine = parse_intent_arg(a.intent)
+        if intent_superseded(sync, mine):
+            print("пропущено: после этого выключения пришло более новое намерение")
+            return
+    else:
+        mine = write_intent(sync, "off")  # сначала намерение: идущий запуск увидит его и отменится
     if sync:
-        wait_app_start_finished(sync)         # приложение как раз запускается — дать ему закончить, потом выключить
+        wait_app_start_finished(sync)     # приложение как раз запускается — дать ему закончить, потом выключить
+        if intent_superseded(sync, mine):
+            print("пропущено: после этого выключения пришло более новое намерение")
+            return
     app_on = app_vpn_on(sync) if sync else None
     if app_on and not is_active(st):
         send_app_command(sync, "disconnect")     # своего движка нет — права и служба не нужны
         print("✓ VPN выключен (в приложении AxiOm)")
         return
-    if not require_windows_admin(["down"]):
+    if not require_windows_admin(["down", *intent_args(mine)]):
+        return
+    if intent_superseded(sync, mine):
+        print("пропущено: после этого выключения пришло более новое намерение")
         return
     service_action("stop")
     if app_on:
@@ -3795,15 +3859,15 @@ def cmd_down(st, a):
 def cmd_restart(st, a):
     force = getattr(a, "force", False)
     sync = sync_dir()
-    mine = write_intent(sync, "on") if BASE == "axiom" else None
+    mine = intent_for(sync, a, "on") if BASE == "axiom" else None
     if BASE == "axiom" and sync and app_vpn_on(sync):
         print(APP_ON_MESSAGE + " — restart ничего не делает")
         return
     refuse_other_brand(st, force)   # restart запускает и остановленную службу
-    if not require_windows_admin(["restart", *(["--force"] if force else [])]):
+    if not require_windows_admin(["restart", *(["--force"] if force else []), *intent_args(mine)]):
         return
-    if BASE == "axiom":              # тот же порядок, что у up: подготовка, замок, перепроверки
-        if coordinated_start(st, sync, mine, "restart", wait_ready=False):
+    if BASE == "axiom":              # тот же порядок, что у up: подготовка, замок, перепроверки, ожидание движка
+        if coordinated_start(st, sync, mine, "restart", wait_ready=True):
             print("✓ перезапущен")
         return
     prepare_service(st)
@@ -4322,6 +4386,8 @@ def cmd_import(st, a):
 def cmd_connect(st, a):
     force = getattr(a, "force", False)
     refuse_other_brand(st, force)   # раньше выбора: отказ не должен менять сохранённый выбор
+    sync = sync_dir()
+    mine = intent_for(sync, a, "on")   # одно намерение на действие: до ожидания ack выбора и до UAC
     if getattr(a, "select", None):
         if a.number is not None:
             die("укажите либо номер, либо --select")
@@ -4330,7 +4396,7 @@ def cmd_connect(st, a):
         cmd_use(st, argparse.Namespace(server=str(a.number)))
     elif interactive() and cmd_pick(st, a) is None:
         return
-    cmd_up(st, argparse.Namespace(force=force))
+    cmd_up(st, argparse.Namespace(force=force, intent_state=mine))
 
 
 def update_arguments(parser, *, self_update=False):
@@ -4447,6 +4513,7 @@ def run_cli(argv):
     x.add_argument("number", nargs="?", type=int)
     x.add_argument("--select", metavar="C|P|T", help="AxiOm: сервер тройкой СТРАНА|ПРОТОКОЛ|ТРАНСПОРТ")
     x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
+    x.add_argument("--intent", help=argparse.SUPPRESS)
     x.set_defaults(func=cmd_connect)
 
     x = sp.add_parser("core", help="установка ядра sing-box (Windows)")
@@ -4495,10 +4562,14 @@ def run_cli(argv):
 
     x = sp.add_parser("up", help="включить VPN")
     x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
+    x.add_argument("--intent", help=argparse.SUPPRESS)
     x.set_defaults(func=cmd_up)
-    sp.add_parser("down", aliases=["disconnect"], help="выключить VPN").set_defaults(func=cmd_down)
+    x = sp.add_parser("down", aliases=["disconnect"], help="выключить VPN")
+    x.add_argument("--intent", help=argparse.SUPPRESS)
+    x.set_defaults(func=cmd_down)
     x = sp.add_parser("restart", help="перезапустить")
     x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
+    x.add_argument("--intent", help=argparse.SUPPRESS)
     x.set_defaults(func=cmd_restart)
     x = sp.add_parser("status", help="состояние")
     x.add_argument("--json", action="store_true", help="машинный вывод")
