@@ -1124,7 +1124,7 @@ APP_LOCATION_MAX_AGE_MS = 24 * 3600 * 1000
 def pid_alive(pid):
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    if IS_WIN:
+    if sys.platform == "win32":     # os.kill(pid, 0) на Windows шлёт Ctrl+C — только WinAPI
         import ctypes
         handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
