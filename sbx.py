@@ -198,10 +198,39 @@ def warn(msg):
     print(f"⚠ {msg}", file=sys.stderr)
 
 
+def is_old_cli_state(saved):
+    """state.json прежнего Go-CLI AxiOm: {"subscription_url", "profile_path", "connected", ...}."""
+    return isinstance(saved, dict) and "subscription_url" in saved and "settings" not in saved and "subs" not in saved
+
+
+def migrate_old_cli_state(saved):
+    """Один раз: сохраняет прежний state.json как state.old-cli.json и заводит новое состояние с подпиской «axiom».
+
+    profiles/ и workdir/ старого CLI не трогаются (sbx их не использует). bypass_lan аналога не имеет
+    (LAN в туннель не идёт всегда) и пропускается. Серверы подписки скачает ближайшая команда или `axiom update`.
+    """
+    backup = STATE_FILE.with_name("state.old-cli.json")
+    if not backup.exists():
+        shutil.copy2(STATE_FILE, backup)
+    st = json.loads(json.dumps(DEFAULT_STATE))
+    st["settings"].update(tun_name=DEFAULT_TUN, mixed_port=AXIOM_MIXED_PORT, api_port=AXIOM_API_PORT,
+                          api_secret=secrets.token_hex(16))
+    url = saved.get("subscription_url")
+    if isinstance(url, str) and url.strip():
+        st["subs"].append({"name": "axiom", "url": url.strip(), "hwid": True})
+        st["_old_cli_migrated"] = True
+    save_state(st)
+    print("Перенесена подписка старого AxiOm CLI" if st["subs"] else
+          "Состояние старого AxiOm CLI сохранено в state.old-cli.json (подписки в нём не было)", file=sys.stderr)
+    return st
+
+
 def load_state():
     st = json.loads(json.dumps(DEFAULT_STATE))
     if STATE_FILE.exists():
         saved = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if BASE == "axiom" and is_old_cli_state(saved):
+            return migrate_old_cli_state(saved)
         settings = {**st["settings"], **saved.get("settings", {})}
         st.update(saved)
         st["settings"] = settings
@@ -231,7 +260,7 @@ def save_state(st):
     if not IS_WIN:
         os.chmod(CONF_DIR, 0o700)
     write_private(STATE_FILE, json.dumps({key: value for key, value in st.items()
-                                        if key not in {"_axiom", "_reload_windows"}},
+                                        if key not in {"_axiom", "_reload_windows", "_old_cli_migrated"}},
                                        ensure_ascii=False, indent=2))
 
 
@@ -1759,6 +1788,122 @@ def axiom_write_selection(app, choice):
     app["prefs"] = prefs
 
 
+# ─── синхронизация с приложением AxiOm (cli-sync) ─────────────────────────────
+
+SYNC_STALE_MS = 10_000      # сердцебиение app-state.json старше — приложение не запущено
+SYNC_ACK_TIMEOUT = 15.0     # сколько ждать control-ack.json
+SYNC_POLL = 0.2
+
+
+def sync_dir():
+    """<каталог приложения>/cli-sync или None: не режим AxiOm, приложение не найдено, каталог недоступен."""
+    if BASE != "axiom":
+        return None
+    try:
+        app = axiom_locations()
+    except (OSError, ValueError):
+        return None
+    return app["root"] / "cli-sync" if app else None
+
+
+def read_sync_json(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def app_state(sync=None):
+    """Состояние движка приложения или None (нет файла, битый, сердцебиение старше 10 с)."""
+    sync = sync_dir() if sync is None else sync
+    if sync is None:
+        return None
+    data = read_sync_json(sync / "app-state.json")
+    beat = data.get("heartbeat") if data else None
+    if not isinstance(beat, (int, float)) or isinstance(beat, bool):
+        return None
+    if abs(time.time() * 1000 - beat) > SYNC_STALE_MS:
+        return None
+    return data
+
+
+def app_engine_connected(sync=None):
+    state = app_state(sync)
+    return state if state and state.get("connected") is True else None
+
+
+def write_control(sync, cmd, selection=None):
+    """Атомарно (tmp + rename) записывает control.json; возвращает id команды."""
+    command = {"v": 1, "id": str(uuid.uuid4()), "ts": int(time.time() * 1000), "cmd": cmd}
+    if selection is not None:
+        command["selection"] = {"c": selection[0], "p": selection[1], "t": selection[2]}
+    for attempt in range(5):
+        try:
+            write_private(sync / "control.json", json.dumps(command, ensure_ascii=False))
+            break
+        except PermissionError:      # Windows: приложение как раз читает файл
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
+    return command["id"]
+
+
+def wait_ack(sync, command_id):
+    deadline = time.monotonic() + SYNC_ACK_TIMEOUT
+    while True:
+        ack = read_sync_json(sync / "control-ack.json")
+        if ack and ack.get("id") == command_id:
+            return ack
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(SYNC_POLL)
+
+
+def send_app_command(sync, cmd, selection=None):
+    """Отправляет команду приложению и ждёт подтверждения; ошибка или таймаут — выход с кодом 1."""
+    ack = wait_ack(sync, write_control(sync, cmd, selection))
+    if ack is None:
+        die(f"приложение AxiOm не подтвердило команду за {SYNC_ACK_TIMEOUT:g} с")
+    if not ack.get("ok"):
+        die(f"приложение AxiOm отклонило команду: {ack.get('error') or 'ошибка'}")
+
+
+def parse_select(text):
+    parts = text.split("|")
+    if len(parts) == 1:
+        parts += ["", ""]
+    if len(parts) != 3 or not parts[0]:
+        die('--select: нужен вид "СТРАНА|ПРОТОКОЛ|ТРАНСПОРТ" (или __auto__)')
+    return tuple(part.strip() for part in parts)
+
+
+def resolve_select(st, text):
+    """--select "C|P|T" -> (тройка приложения, тег сервера или "auto"); не из текущего меню — ошибка."""
+    if not st.get("_axiom") or not st["_axiom"].get("root"):
+        die("--select работает только в режиме AxiOm при найденном приложении")
+    country, protocol, transport = parse_select(text)
+    if country == AXIOM_AUTO:
+        if protocol or transport:
+            die("--select: для __auto__ протокол и транспорт не указывают")
+        return (AXIOM_AUTO, "", ""), "auto"
+    options = axiom_sorted(axiom_options(all_servers(st)))
+    found = [(key, tag) for key, tag in options if key[0] == country]
+    if not found:
+        die(f"--select: страны «{country}» нет в меню; доступны: "
+            + ", ".join(dict.fromkeys(key[0] for key, _ in options)))
+    if protocol:
+        found = [(key, tag) for key, tag in found if key[1] == protocol]
+        if not found:
+            die(f"--select: у «{country}» нет протокола «{protocol}»")
+    if transport:
+        found = [(key, tag) for key, tag in found if key[2] == transport]
+        if not found:
+            die(f"--select: у «{country}|{protocol}» нет транспорта «{transport}»")
+    key, tag = found[0]
+    return key, tag
+
+
 def selected_server(st, servers):
     app = st.get("_axiom")
     if app and app["root"]:
@@ -2587,7 +2732,11 @@ def cmd_ls(st, a):
 
 
 def cmd_use(st, a):
-    tag = resolve(st, a.server)
+    triple = None
+    if getattr(a, "select", None):
+        triple, tag = resolve_select(st, a.select)
+    else:
+        tag = resolve(st, a.server)
     app = st.get("_axiom")
     if app:
         options, extras = axiom_menu(all_servers(st))
@@ -2595,17 +2744,33 @@ def cmd_use(st, a):
         if tag == "auto" or choice:
             axiom_write_selection(app, choice)
             st.pop("axiom_extra", None)
+            triple = triple or (tuple(choice) if choice else (AXIOM_AUTO, "", ""))
         elif options and tag in extras:
             st["axiom_extra"] = {"tag": tag, "prefs": axiom_prefs_now(app)}
     st["selected"] = tag
     save_state(st)
     apply(st, reload=False)
+    sync = sync_dir() if app and app.get("root") else None
     if is_active(st) and api_up(st):
         api(st, "PUT", "/proxies/proxy", {"name": tag})
+    elif sync and app_engine_connected(sync):
+        if triple:
+            send_app_command(sync, "select", triple)
+        else:
+            warn("свой сервер sbx нельзя применить в приложении AxiOm: выбор сохранён только для CLI")
 
     if IS_WIN and interactive() and task_definition(BASE) is not None:
         warn("для сохранения выбора после перезагрузки задачи SYSTEM: sbx restart")
     print(f"✓ выбран {tag}")
+
+
+def cmd_use_or_pick(st, a):
+    if a.select and a.server:
+        die("укажите либо сервер, либо --select")
+    if a.server or a.select:
+        cmd_use(st, a)
+    else:
+        cmd_pick(st, a)
 
 
 def ls_axiom(st, servers, menu, query):
@@ -3162,7 +3327,14 @@ def refuse_other_brand(st, force):
         die(f"{reason}.\nСначала выключите его ({other['name']} down) или запустите с --force")
 
 
+APP_ON_MESSAGE = "VPN уже включён в приложении AxiOm"
+
+
 def cmd_up(st, a):
+    sync = sync_dir()
+    if sync and app_engine_connected(sync):
+        print(APP_ON_MESSAGE)
+        return
     refuse_other_brand(st, a.force)
     if not require_windows_admin(["up", *(["--force"] if a.force else [])]):
         return
@@ -3186,9 +3358,17 @@ def cmd_up(st, a):
 
 
 def cmd_down(st, a):
+    sync = sync_dir()
+    app_on = app_engine_connected(sync) if sync else None
+    if app_on and not is_active(st):
+        send_app_command(sync, "disconnect")     # своего движка нет — права и служба не нужны
+        print("✓ VPN выключен (в приложении AxiOm)")
+        return
     if not require_windows_admin(["down"]):
         return
     service_action("stop")
+    if app_on:
+        send_app_command(sync, "disconnect")
     print("✓ VPN выключен")
 
 
@@ -3206,8 +3386,11 @@ def show_status(st):
     active = is_active(st)
     enabled = task_enabled(BASE) if IS_WIN else unit_prop("UnitFileState")
     s = st["settings"]
+    app_on = app_engine_connected()
     print(f"состояние:   {'работает' if active else 'выключен'}"
           f"  (автозапуск: {'да' if enabled == 'enabled' else 'нет'})")
+    if app_on:
+        print("приложение:  подключено через приложение AxiOm" + (f" · {app_on['rawTag']}" if app_on.get("rawTag") else ""))
     print(f"режим:       {'TUN + ' if s['mode'] == 'tun' else ''}прокси 127.0.0.1:{s['mixed_port']}"
           f" · маршрут {effective_route(st)}")
     selected = selected_server(st, all_servers(st)) if st.get("_axiom") else st["selected"]
@@ -3236,7 +3419,31 @@ def unit_prop_of(unit, prop):
     return r.stdout.strip()
 
 
+def status_info(st):
+    sync = sync_dir()
+    app_on = app_engine_connected(sync) if sync else None
+    cli_on = is_active(st)
+    selection = None
+    if app_on and isinstance(app_on.get("selection"), dict):
+        chosen = app_on["selection"]
+        selection = {key: chosen.get(key) or "" for key in "cpt"}
+    elif st.get("_axiom") and st["_axiom"].get("root"):
+        country, protocol, transport = (value or "" for value in axiom_prefs_now(st["_axiom"]))
+        selection = {"c": country or AXIOM_AUTO, "p": protocol, "t": transport}
+    server = None
+    if cli_on:
+        node = current_node(st)
+        server = node.split(" → ")[-1] if node else None
+    elif app_on:
+        server = app_on.get("rawTag")
+    return {"vpn": "on" if cli_on or app_on else "off", "engine": "cli" if cli_on else "app" if app_on else None,
+            "selection": selection, "server": server, "version": __version__}
+
+
 def cmd_status(st, a):
+    if getattr(a, "json", False):
+        print(json.dumps(status_info(st), ensure_ascii=False))
+        return
     show_status(st)
 
 
@@ -3683,7 +3890,11 @@ def cmd_import(st, a):
 def cmd_connect(st, a):
     force = getattr(a, "force", False)
     refuse_other_brand(st, force)   # раньше выбора: отказ не должен менять сохранённый выбор
-    if a.number is not None:
+    if getattr(a, "select", None):
+        if a.number is not None:
+            die("укажите либо номер, либо --select")
+        cmd_use(st, argparse.Namespace(server=None, select=a.select))
+    elif a.number is not None:
         cmd_use(st, argparse.Namespace(server=str(a.number)))
     elif interactive() and cmd_pick(st, a) is None:
         return
@@ -3802,6 +4013,7 @@ def run_cli(argv):
     x.set_defaults(func=cmd_import)
     x = sp.add_parser("connect", help="выбрать сервер и подключиться; 0 — авто")
     x.add_argument("number", nargs="?", type=int)
+    x.add_argument("--select", metavar="C|P|T", help="AxiOm: сервер тройкой СТРАНА|ПРОТОКОЛ|ТРАНСПОРТ")
     x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
     x.set_defaults(func=cmd_connect)
 
@@ -3839,7 +4051,8 @@ def run_cli(argv):
 
     x = sp.add_parser("use", help="выбрать сервер: номер, часть имени или auto; без аргумента — меню")
     x.add_argument("server", nargs="?")
-    x.set_defaults(func=lambda st, a: cmd_use(st, a) if a.server else cmd_pick(st, a))
+    x.add_argument("--select", metavar="C|P|T", help="AxiOm: сервер тройкой СТРАНА|ПРОТОКОЛ|ТРАНСПОРТ")
+    x.set_defaults(func=cmd_use_or_pick)
     sp.add_parser("pick", help="интерактивный выбор сервера (↑↓, пробел — пинг, Enter)"
                   ).set_defaults(func=cmd_pick)
 
@@ -3855,7 +4068,9 @@ def run_cli(argv):
     x = sp.add_parser("restart", help="перезапустить")
     x.add_argument("-f", "--force", action="store_true", help="даже если работает другой VPN")
     x.set_defaults(func=cmd_restart)
-    sp.add_parser("status", help="состояние").set_defaults(func=cmd_status)
+    x = sp.add_parser("status", help="состояние")
+    x.add_argument("--json", action="store_true", help="машинный вывод")
+    x.set_defaults(func=cmd_status)
     sp.add_parser("ip", help="внешний IP через VPN").set_defaults(func=cmd_ip)
     x = sp.add_parser("probe", help="проверить ядро, TUN и подписку без перехвата трафика")
     x.add_argument("-a", "--all", action="store_true", help="проверить все серверы")
@@ -3920,6 +4135,11 @@ def run_cli(argv):
                     st["_axiom"] = empty_axiom_context()
         if not STATE_FILE.exists():
             save_state(st)
+        if st.get("_old_cli_migrated") and a.cmd not in SERVICE_ONLY_COMMANDS | {"status", "sub", "update", "import"}:
+            try:   # серверы перенесённой подписки; нет сети — остаётся `axiom update`
+                update_subs(st, ["axiom"], quiet=True)
+            except (OSError, ValueError, urllib.error.URLError):
+                warn("серверы перенесённой подписки не скачались: axiom update")
         a.func(st, a)
         if st.get("_reload_windows"):
             print("Для применения нового конфига надо перезапустить задачу sbx (UAC).", flush=True)
