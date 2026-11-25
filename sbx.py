@@ -66,7 +66,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 HOME = Path.home()
 IS_WIN = os.name == "nt"
@@ -2254,6 +2254,172 @@ def selected_server(st, servers):
     return st["selected"]
 
 
+# ─── выбранный сервер переживает обновления подписок ───────────────────────────
+#
+# Выбор хранится тегом, а тег — это имя из подписки: панель переименовала сервер — тега больше нет.
+# Раньше конфиг в таком случае молча собирался с auto. Теперь рядом с тегом лежит отпечаток сервера
+# (selected_ref), и перед каждой сборкой конфига выбор сверяется со списком:
+#   1) тот же сервер под новым именем — выбор переезжает;
+#   2) иначе как в приложении AxiOm: та же страна с тем же или первым доступным протоколом и транспортом;
+#   3) иначе auto — записанный в состояние, с предупреждением и строкой в status, а не молча.
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def server_ref(server):
+    """Отпечаток сервера для поиска под новым именем. Только хеши: адресов и ключей в состоянии не появляется."""
+    o = server["outbound"]
+    tls, transport = o.get("tls") or {}, o.get("transport") or {}
+    return {"tag": server["tag"], "source": server["source"],
+            # весь узел, кроме имён: совпал — это тот же сервер
+            "key": digest({key: value for key, value in o.items() if key not in ("tag", "detour")}),
+            # куда и под каким именем хоста он подключается: переживает смену ключей и мелких параметров
+            "route": digest([o.get("type"), o.get("server"), o.get("server_port"), tls.get("server_name"),
+                             transport.get("type"), transport.get("path"), transport.get("service_name"),
+                             (transport.get("headers") or {}).get("Host"), transport.get("host")])}
+
+
+def server_group(server):
+    return axiom_classify(server.get("display", server["tag"]))
+
+
+def follow_server(ref, old_tag, servers):
+    """Сервера с тегом old_tag больше нет: куда переезжает выбор -> (тег, "renamed" | "changed") или (None, "lost").
+
+    ref — сохранённый server_ref (None у состояния от версий до 1.4.1: тогда остаётся только сверка по имени).
+    """
+    ref = ref if isinstance(ref, dict) else {}
+    pool = [s for s in servers if s["source"] == ref["source"]] if ref.get("source") else list(servers)
+    group = axiom_classify(old_tag)
+    refs = {s["tag"]: server_ref(s) for s in servers}
+
+    # 1. Тот же узел под новым именем. Одинаковые узлы взаимозаменяемы, поэтому хватит любого совпадения;
+    #    подписку могли пересоздать под другим именем — тогда ищем по всем.
+    if ref.get("key"):
+        same = [s for s in pool if refs[s["tag"]]["key"] == ref["key"]] or \
+               [s for s in servers if refs[s["tag"]]["key"] == ref["key"]]
+        if same:
+            return next((s for s in same if group and server_group(s) == group), same[0])["tag"], "renamed"
+    # 2. Имя по правилам AxiOm «Страна (аккаунт) [транспорт]»: та же страна, протокол и транспорт —
+    #    сменилась только часть в скобках.
+    named = [(server_group(s), s) for s in pool]
+    country = [(key, s) for key, s in named if group and key and key[0] == group[0]]
+    for key, s in country:
+        if key == group:
+            return s["tag"], "renamed"
+    # 3. Тот же адрес и то же имя хоста, но другие ключи или параметры. Только при единственном кандидате:
+    #    за одним адресом (CDN) бывает несколько стран, и ошибиться страной хуже, чем уйти в auto.
+    if ref.get("route"):
+        routed = [s for s in pool if refs[s["tag"]]["route"] == ref["route"]]
+        if len(routed) == 1:
+            return routed[0]["tag"], "renamed"
+    # 4. Как в приложении AxiOm: страна на месте — тот же протокол или первый по порядку приложения,
+    #    тот же транспорт или первый.
+    if country:
+        ordered = axiom_sorted([(key, s["tag"]) for key, s in country])
+        protocol = [(key, tag) for key, tag in ordered if key[1] == group[1]] or \
+                   [(key, tag) for key, tag in ordered if key[1] == ordered[0][0][1]]
+        return next((tag for key, tag in protocol if key[2] == group[2]), protocol[0][1]), "changed"
+    return None, "lost"
+
+
+SELECTION_KEYS = ("selected", "selected_ref", "selection_note", "axiom_extra")
+
+
+def remember_choice(st, tag, servers):
+    """Выбор сделан человеком: запомнить отпечаток сервера и убрать прошлое предупреждение."""
+    server = next((s for s in servers if s["tag"] == tag), None)
+    if server:
+        st["selected_ref"] = server_ref(server)
+    else:
+        st.pop("selected_ref", None)
+    st.pop("selection_note", None)
+
+
+def selection_note_text(note):
+    old, new = note.get("from"), note.get("to")
+    if note.get("kind") == "renamed":
+        return f"сервер «{old}» в подписке теперь называется «{new}» — выбор перенесён"
+    if note.get("kind") == "changed":
+        return f"сервера «{old}» больше нет — выбран «{new}» (та же страна)"
+    if note.get("kind") == "extra":
+        return f"своего сервера «{old}» больше нет — действует выбор приложения AxiOm"
+    return f"сервера «{old}» больше нет — включён auto (самый быстрый); выбрать сервер: {BASE} use"
+
+
+def reconcile_selection(st, servers):
+    """Сверяет сохранённый выбор со списком серверов. True — выбор в st изменился и его надо сохранить."""
+    if not servers:
+        return False
+    by_tag = {s["tag"]: s for s in servers}
+
+    def note(kind, old, new):
+        st["selection_note"] = {"at": int(time.time()), "kind": kind, "from": old, "to": new}
+        warn("выбор сервера: " + selection_note_text(st["selection_note"]))
+
+    app = st.get("_axiom")
+    if app and app["root"] and (options := axiom_options(servers)):
+        # выбор по странам хранит и чинит само приложение; у CLI здесь только «свой сервер» поверх него
+        extra = st.get("axiom_extra")
+        if not isinstance(extra, dict) or extra.get("prefs") != axiom_prefs_now(app):
+            return False
+        tag = extra.get("tag")
+        if tag in by_tag:
+            ref = server_ref(by_tag[tag])
+            if extra.get("ref") == ref:
+                return False
+            extra["ref"] = ref
+            return True
+        own = set(axiom_extras(servers, options))
+        new, kind = follow_server(extra.get("ref"), tag, [s for s in servers if s["tag"] in own])
+        if new and kind == "renamed":
+            extra.update(tag=new, ref=server_ref(by_tag[new]))
+            st["selected"] = new
+            note("renamed", tag, new)
+        else:
+            st.pop("axiom_extra")
+            note("extra", tag, None)
+        return True
+
+    tag = st["selected"]
+    if tag == "auto":
+        return st.pop("selected_ref", None) is not None
+    if tag in by_tag:
+        ref = server_ref(by_tag[tag])
+        if st.get("selected_ref") == ref:
+            return False
+        st["selected_ref"] = ref        # имя на месте — оно и главное, как в приложении; отпечаток обновляется
+        return True
+    new, kind = follow_server(st.get("selected_ref"), tag, servers)
+    if new:
+        st["selected"], st["selected_ref"] = new, server_ref(by_tag[new])
+        if isinstance(st["latency"].get(tag), int):
+            st["latency"].setdefault(new, st["latency"][tag])
+    else:
+        st["selected"] = "auto"
+        st.pop("selected_ref", None)
+    note(kind, tag, new or "auto")
+    return True
+
+
+def save_selection(st):
+    """Записать в state.json только выбор сервера.
+
+    apply() зовут и с ещё не сохранёнными настройками (set, rule: они сохраняются после проверки конфига),
+    поэтому весь st отсюда сохранять нельзя.
+    """
+    saved = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else None
+    if not isinstance(saved, dict):
+        return      # состояния на диске ещё нет: его целиком сохранит вызвавшая команда
+    for key in SELECTION_KEYS:
+        if key in st:
+            saved[key] = st[key]
+        else:
+            saved.pop(key, None)
+    write_private(STATE_FILE, json.dumps(saved, ensure_ascii=False, indent=2))
+
+
 VIA_PREFIX = "via: "   # теги групп для via_rules вида re:… (имя сервера так начинаться не может)
 
 
@@ -2426,6 +2592,8 @@ def apply(st, reload=True, quiet=False):
     servers = all_servers(st)
     if not servers:
         die("серверов нет: добавьте подписку (sbx sub add) или сервер (sbx add)")
+    if reconcile_selection(st, servers):     # подписка могла переименовать или убрать выбранный сервер
+        save_selection(st)
     text = json.dumps(build_config(st, servers), ensure_ascii=False, indent=2)
     old = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else None
     if text == old:
@@ -3172,9 +3340,12 @@ def cmd_use(st, a):
             st.pop("axiom_extra", None)
         elif options and tag in extras:
             st["axiom_extra"] = {"tag": tag, "prefs": axiom_prefs_now(app)}
+            if own := next((s for s in all_servers(st) if s["tag"] == tag), None):
+                st["axiom_extra"]["ref"] = server_ref(own)
             if app_running:
                 warn("свой сервер sbx нельзя применить в приложении AxiOm: выбор сохранён только для CLI")
     st["selected"] = tag
+    remember_choice(st, tag, all_servers(st))
     save_state(st)
     if send:
         send_app_command(sync, "select", triple)      # раньше конфига CLI: приложению не нужны ни ядро, ни apply
@@ -3886,8 +4057,15 @@ def show_status(st):
         print("приложение:  подключено через приложение AxiOm" + (f" · {app_on['rawTag']}" if app_on.get("rawTag") else ""))
     print(f"режим:       {'TUN + ' if s['mode'] == 'tun' else ''}прокси 127.0.0.1:{s['mixed_port']}"
           f" · маршрут {effective_route(st)}")
-    selected = selected_server(st, all_servers(st)) if st.get("_axiom") else st["selected"]
-    print(f"выбран:      {selected}")
+    servers = all_servers(st)
+    selected = selected_server(st, servers) if st.get("_axiom") else st["selected"]
+    stale = selected != "auto" and servers and selected not in {server["tag"] for server in servers}
+    print(f"выбран:      {selected}" + ("  ⚠ в списке его нет — сейчас auto" if stale else ""))
+    note = st.get("selection_note")
+    # о переименовании достаточно напоминать неделю; о замене сервера и об auto — пока выбор не сделают заново
+    if isinstance(note, dict) and (note.get("kind") != "renamed" or time.time() - note.get("at", 0) < 7 * 86400):
+        when = time.strftime("%d.%m %H:%M", time.localtime(note.get("at", 0)))
+        print(f"внимание:    {when} {selection_note_text(note)}")
     if active:
         node = current_node(st)
         if node:
