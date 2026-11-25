@@ -76,59 +76,73 @@ def test_renamed_server_with_rotated_keys_is_found_by_address(st):
     write_sub('main', [(USA, node('us.example', uuid='00000000-0000-4000-8000-0000000000ff')),
                        (GERMANY_WS, node('de.example'))])
     sbx.apply(st)
-    assert st['selected'] == USA and default_outbound() == USA
+    assert default_outbound() == USA and saved()['selected'] == USA_DEV   # похоже, но не тот же узел — на время
 
 
 def test_shared_address_is_not_followed_blindly(st, capsys):
-    """За одним адресом CDN несколько стран: без однозначного совпадения — auto, а не чужая страна."""
-    cdn = dict(port=443)
-    write_sub('main', [(USA_DEV, node('cdn.example', path='/us', **cdn)),
-                       (GERMANY_WS, node('cdn.example', path='/de', **cdn))])
+    """За одним адресом CDN несколько стран: без однозначного совпадения и без той же страны — auto."""
+    write_sub('main', [(USA_DEV, node('cdn.example', path='/us')), (GERMANY_WS, node('cdn.example', path='/de'))])
     choose(st, USA_DEV)
-    write_sub('main', [('Italy (user) [ws]', node('cdn.example', path='/it', **cdn)),
-                       (GERMANY_WS, node('cdn.example', path='/de', **cdn))])
+    write_sub('main', [('Italy (user) [ws]', node('cdn.example', path='/it')),
+                       (GERMANY_WS, node('cdn.example', path='/de'))])
     capsys.readouterr()
     sbx.apply(st)
-    assert st['selected'] == 'auto' and default_outbound() == 'auto'
-    assert saved()['selected'] == 'auto' and 'selected_ref' not in saved()
+    assert default_outbound() == 'auto'
+    assert saved()['selected'] == USA_DEV                    # выбор не перезаписан: он вернётся
     assert saved()['selection_note'] == {**saved()['selection_note'], 'kind': 'lost', 'from': USA_DEV, 'to': 'auto'}
     assert 'auto' in capsys.readouterr().err
 
 
 def test_two_servers_at_the_old_address_are_a_tie_not_a_guess(st):
     """Прежние адрес и имя хоста теперь у двух серверов с другими ключами: какой из них прежний — неизвестно."""
-    other = '00000000-0000-4000-8000-0000000000bb'
     write_sub('main', [(USA_DEV, node('us.example')), (GERMANY_WS, node('de.example'))])
     choose(st, USA_DEV)
-    write_sub('main', [('Canada (user) [ws]', node('us.example', uuid=other)),
+    write_sub('main', [('Canada (user) [ws]', node('us.example', uuid='00000000-0000-4000-8000-0000000000bb')),
                        ('Mexico (user) [ws]', node('us.example', uuid='00000000-0000-4000-8000-0000000000cc')),
                        (GERMANY_WS, node('de.example'))])
     sbx.apply(st)
-    assert st['selected'] == 'auto' and saved()['selection_note']['kind'] == 'lost'
+    assert default_outbound() == 'auto' and saved()['selection_note']['kind'] == 'lost'
 
 
-def test_account_part_of_the_name_changes_like_in_the_app(st):
-    """«Страна (аккаунт) [транспорт]»: сменился аккаунт и адрес — страна, протокол и транспорт те же."""
-    write_sub('main', [(GERMANY_WS, node('de.example')), (FRANCE_WS, node('fr.example'))])
-    choose(st, GERMANY_WS)
-    write_sub('main', [('Germany (other) [ws]', node('de2.example', uuid='00000000-0000-4000-8000-0000000000aa')),
-                       (FRANCE_WS, node('fr.example'))])
+@pytest.mark.parametrize('new_name', ['🇺🇸 United States (other) [ws]', 'USA (other) [ws]', 'США (other) [ws]',
+                                      '🇺🇸 USA (user) [ws]'])
+def test_country_is_found_by_flag_or_name_not_by_exact_string(st, new_name):
+    """«🇺🇸 USA dev» пропал, вместо него другой узел «США»/«United States»: страна та же — он и используется."""
+    write_sub('main', [(USA_DEV, node('us.example')), (GERMANY_WS, node('de.example'))])
+    choose(st, USA_DEV)
+    write_sub('main', [(new_name, node('us2.example', uuid='00000000-0000-4000-8000-0000000000aa')),
+                       (GERMANY_WS, node('de.example'))])
     sbx.apply(st)
-    assert st['selected'] == 'Germany (other) [ws]' and st['selection_note']['kind'] == 'renamed'
+    assert default_outbound() == new_name
+    assert saved()['selected'] == USA_DEV and saved()['selection_note']['kind'] == 'changed'
 
 
-def test_removed_transport_falls_back_inside_the_country_like_in_the_app(st, capsys):
-    """Как в приложении AxiOm: транспорта не стало — тот же протокол той же страны, первый транспорт."""
-    write_sub('main', [(GERMANY_WS, node('de-ws.example')), (GERMANY_TCP, node('de-tcp.example', path='/tcp')),
-                       (GERMANY_HY2, node('de-hy.example', kind='hysteria2')), (FRANCE_WS, node('fr.example'))])
+def test_country_names_and_flags():
+    for name in ('🇺🇸 USA dev', 'USA', 'United States', 'США', 'usa-dev'):
+        assert sbx.country_code(name) == 'US', name
+    assert sbx.country_code('🇩🇪Германия [Билайн]') == 'DE'
+    assert sbx.country_code('Germany #2') == 'DE'
+    assert sbx.country_code('South Korea') == 'KR'
+    assert sbx.country_code('🔁 Запасной') is None
+
+
+def test_removed_transport_is_replaced_inside_the_country_and_comes_back(st, capsys):
+    """Как в приложении AxiOm: транспорта не стало — тот же протокол той же страны, первый транспорт.
+    В отличие от приложения 4.x — только на время: вернулся транспорт — вернулся и выбор."""
+    full = [(GERMANY_WS, node('de-ws.example')), (GERMANY_TCP, node('de-tcp.example', path='/tcp')),
+            (GERMANY_HY2, node('de-hy.example', kind='hysteria2')), (FRANCE_WS, node('fr.example'))]
+    write_sub('main', full)
     choose(st, GERMANY_WS)
-    write_sub('main', [(GERMANY_TCP, node('de-tcp.example', path='/tcp')),
-                       (GERMANY_HY2, node('de-hy.example', kind='hysteria2')), (FRANCE_WS, node('fr.example'))])
+    write_sub('main', full[1:])
     capsys.readouterr()
     sbx.apply(st)
-    assert st['selected'] == GERMANY_TCP and default_outbound() == GERMANY_TCP
+    assert default_outbound() == GERMANY_TCP and saved()['selected'] == GERMANY_WS
     assert saved()['selection_note']['kind'] == 'changed'
     assert GERMANY_TCP in capsys.readouterr().err
+    write_sub('main', full)
+    sbx.apply(st)
+    assert default_outbound() == GERMANY_WS and 'selection_note' not in saved()
+    assert 'снова в подписке' in capsys.readouterr().err
 
 
 def test_removed_protocol_falls_back_to_the_first_protocol_of_the_country(st):
@@ -137,17 +151,16 @@ def test_removed_protocol_falls_back_to_the_first_protocol_of_the_country(st):
     choose(st, GERMANY_HY2)
     write_sub('main', [(GERMANY_TCP, node('de-tcp.example', path='/tcp')), (FRANCE_WS, node('fr.example'))])
     sbx.apply(st)
-    assert st['selected'] == GERMANY_TCP
+    assert default_outbound() == GERMANY_TCP
 
 
-def test_removed_country_becomes_recorded_auto_and_status_says_so(st, capsys, monkeypatch):
-    """Как в приложении AxiOm: страны не стало — auto записывается в состояние; молча это не происходит."""
+def test_removed_country_is_auto_until_it_comes_back(st, capsys, monkeypatch):
     write_sub('main', [(GERMANY_WS, node('de.example')), (FRANCE_WS, node('fr.example'))])
     choose(st, GERMANY_WS)
     write_sub('main', [(FRANCE_WS, node('fr.example'))])
     capsys.readouterr()
     sbx.apply(st)
-    assert saved()['selected'] == 'auto' and default_outbound() == 'auto'
+    assert default_outbound() == 'auto' and saved()['selected'] == GERMANY_WS
     assert GERMANY_WS in capsys.readouterr().err
     sbx.apply(st)                                   # повторная сборка не шумит и ничего не меняет
     assert 'выбор сервера' not in capsys.readouterr().err
@@ -157,16 +170,19 @@ def test_removed_country_becomes_recorded_auto_and_status_says_so(st, capsys, mo
     monkeypatch.setattr(sbx, 'app_vpn_on', lambda *args, **kwargs: None)
     sbx.show_status(st)
     out = capsys.readouterr().out
-    assert 'выбран:      auto' in out and 'внимание:' in out and GERMANY_WS in out
+    assert f'выбран:      {GERMANY_WS}' in out and 'пока auto' in out and 'внимание:' in out
+    write_sub('main', [(GERMANY_WS, node('de.example')), (FRANCE_WS, node('fr.example'))])
+    sbx.apply(st)
+    assert default_outbound() == GERMANY_WS and 'selection_note' not in saved()
 
 
-def test_state_from_1_4_0_without_fingerprint_loses_a_renamed_server_loudly(st, capsys):
-    """Состояние старой версии: отпечатка нет, имя страны изменилось — узнать сервер нечем. Auto, но не молча."""
+def test_state_from_1_4_0_finds_a_renamed_country_by_flag(st, capsys):
+    """Состояние старой версии без отпечатка, ровно случай 24.11.2026: «🇺🇸 USA dev» -> «🇺🇸 USA»."""
     write_sub('main', [(USA, node('us.example')), (GERMANY_WS, node('de.example'))])
     st['selected'] = USA_DEV
     sbx.save_state(st)
     sbx.apply(st)
-    assert saved()['selected'] == 'auto' and saved()['selection_note']['from'] == USA_DEV
+    assert default_outbound() == USA and saved()['selection_note']['to'] == USA
     assert USA_DEV in capsys.readouterr().err
 
 
@@ -179,7 +195,7 @@ def test_state_from_1_4_0_gets_a_fingerprint_while_the_server_is_still_there(st,
     assert 'selection_note' not in saved() and 'выбор сервера' not in capsys.readouterr().err
     write_sub('main', [(USA, node('us.example')), (GERMANY_WS, node('de.example'))])
     sbx.apply(st)
-    assert saved()['selected'] == USA
+    assert saved()['selected'] == USA and saved()['selection_note']['kind'] == 'renamed'
 
 
 def test_same_name_wins_over_the_fingerprint(st, capsys):
@@ -257,10 +273,26 @@ def test_own_server_over_the_app_choice_follows_a_rename_and_never_touches_app_s
     assert sbx.reconcile_selection(st, renamed)
     assert st['axiom_extra']['tag'] == 'Mine 2' and sbx.selected_server(st, renamed) == 'Mine 2'
 
-    assert sbx.reconcile_selection(st, [app_server])
-    assert 'axiom_extra' not in st and st['selection_note']['kind'] == 'extra'
+    assert sbx.reconcile_selection(st, [app_server])              # свой сервер пропал — пока выбор приложения
+    assert st['axiom_extra']['tag'] == 'Mine 2' and st['selection_note']['kind'] == 'extra'
     assert sbx.selected_server(st, [app_server]) == FRANCE_WS
+    assert sbx.reconcile_selection(st, renamed)                   # вернулся — вернулся и выбор
+    assert sbx.selected_server(st, renamed) == 'Mine 2' and 'selection_note' not in st
     assert st['_axiom']['prefs'] == prefs
+
+
+def test_app_country_is_found_by_code_and_comes_back():
+    """Режим AxiOm: страна в настройках приложения — «🇺🇸 USA dev», в меню только «🇺🇸 USA»: это она же."""
+    usa = {'tag': USA, 'source': 'app:App', 'outbound': node('us.example'),
+           'app_profile': True, 'app_group': True, 'app_order': 0}
+    germany = {**usa, 'tag': GERMANY_WS, 'outbound': node('de.example')}
+    app = {'root': 'present', 'prefix': 'flutter.', 'prefs': {
+        'flutter.server_selector_country': '🇺🇸 USA dev', 'flutter.server_selector_protocol': 'vless',
+        'flutter.server_selector_transport': 'ws'}}
+    assert sbx.axiom_chosen(app, sbx.axiom_options([usa, germany])) == USA
+    assert sbx.axiom_chosen(app, sbx.axiom_options([germany])) == 'auto'
+    back = {**usa, 'tag': USA_DEV}
+    assert sbx.axiom_chosen(app, sbx.axiom_options([usa, back, germany])) == USA_DEV   # точное имя важнее
 
 
 def test_status_json_is_unchanged_by_the_note(st, monkeypatch):

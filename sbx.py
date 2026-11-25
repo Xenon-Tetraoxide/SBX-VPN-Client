@@ -1747,6 +1747,49 @@ AXIOM_COUNTRIES = {
 }
 
 
+COUNTRY_NAMES = {
+    **AXIOM_COUNTRIES,
+    "united states of america": "US", "great britain": "GB", "england": "GB", "holland": "NL",
+    "нидерланды": "NL", "голландия": "NL", "франция": "FR", "россия": "RU", "польша": "PL", "германия": "DE",
+    "сша": "US", "соединённые штаты": "US", "соединенные штаты": "US", "великобритания": "GB", "британия": "GB",
+    "англия": "GB", "финляндия": "FI", "швеция": "SE", "норвегия": "NO", "турция": "TR", "япония": "JP",
+    "сингапур": "SG", "канада": "CA", "италия": "IT", "испания": "ES", "швейцария": "CH", "австрия": "AT",
+    "бельгия": "BE", "чехия": "CZ", "румыния": "RO", "украина": "UA", "казахстан": "KZ", "гонконг": "HK",
+    "тайвань": "TW", "южная корея": "KR", "корея": "KR", "индия": "IN", "бразилия": "BR", "австралия": "AU",
+    "израиль": "IL", "оаэ": "AE", "эмираты": "AE", "ирландия": "IE", "дания": "DK", "португалия": "PT",
+    "венгрия": "HU", "болгария": "BG", "сербия": "RS", "латвия": "LV", "литва": "LT", "эстония": "EE",
+    "молдова": "MD", "грузия": "GE", "армения": "AM", "азербайджан": "AZ",
+}
+
+
+def country_code(name):
+    """Страна в названии сервера -> код ISO или None. Так же считает приложение AxiOm (ServerOption.countryCode).
+
+    Сначала флаг-эмодзи, потом название (английское или русское): целиком или словами внутри — «🇺🇸 USA dev»,
+    «USA», «United States» и «США» — одна страна.
+    """
+    flag = [ord(ch) - 0x1F1E6 for ch in name if 0x1F1E6 <= ord(ch) <= 0x1F1FF]
+    if len(flag) >= 2:
+        return chr(65 + flag[0]) + chr(65 + flag[1])
+    words = " ".join(re.sub(r"[\W\d_]+", " ", name.lower()).split())
+    if not words:
+        return None
+    if words in COUNTRY_NAMES:
+        return COUNTRY_NAMES[words]
+    padded = f" {words} "
+    best = max((key for key in COUNTRY_NAMES if f" {key} " in padded), key=len, default=None)
+    return COUNTRY_NAMES[best] if best else None
+
+
+def axiom_country(options, country):
+    """Страна выбора -> страна из меню: та же строка, иначе страна с тем же кодом (первая по порядку меню)."""
+    countries = list(dict.fromkeys(key[0] for key, _ in axiom_sorted(options)))
+    if country in countries:
+        return country
+    code = country_code(country)
+    return next((name for name in countries if code and country_code(name) == code), None)
+
+
 def axiom_classify(display):
     match = AXIOM_TAG.fullmatch(display.strip())
     if match and (country := match[1].strip()) and (tokens := AXIOM_TOKENS.get(match[2].lower())):
@@ -1755,7 +1798,7 @@ def axiom_classify(display):
 
 
 def axiom_flag(country):
-    code = AXIOM_COUNTRIES.get(country.strip().lower())
+    code = country_code(country)
     return "".join(chr(ord(letter) + 127397) for letter in code) if code else "🏳️"
 
 
@@ -1819,6 +1862,7 @@ def axiom_chosen(app, options):
     country, protocol, transport = (app["prefs"].get(app["prefix"] + key) for key in AXIOM_PREFS)
     if not country or country == AXIOM_AUTO:
         return "auto"
+    country = axiom_country(options, country)     # страну могли переименовать: «USA dev» -> «USA»
     countries = [(key, tag) for key, tag in axiom_sorted(options) if key[0] == country]
     if not countries:
         return "auto"
@@ -2254,14 +2298,14 @@ def selected_server(st, servers):
     return st["selected"]
 
 
-# ─── выбранный сервер переживает обновления подписок ───────────────────────────
+# ─── выбранный сервер и обновления подписок ───────────────────────────────────
 #
-# Выбор хранится тегом, а тег — это имя из подписки: панель переименовала сервер — тега больше нет.
-# Раньше конфиг в таком случае молча собирался с auto. Теперь рядом с тегом лежит отпечаток сервера
-# (selected_ref), и перед каждой сборкой конфига выбор сверяется со списком:
-#   1) тот же сервер под новым именем — выбор переезжает;
-#   2) иначе как в приложении AxiOm: та же страна с тем же или первым доступным протоколом и транспортом;
-#   3) иначе auto — записанный в состояние, с предупреждением и строкой в status, а не молча.
+# Выбор — то, что выбрал человек (тег; в режиме AxiOm — страна/протокол/транспорт приложения). Пока сервер просто
+# пропал из подписки, выбор не перезаписывается. Перед каждой сборкой конфига он сверяется со списком серверов:
+#   - тот же узел под новым именем (совпал отпечаток selected_ref) — выбор переезжает на новое имя насовсем;
+#   - сервера нет — как в приложении AxiOm, но только на время: та же страна (по флагу или названию, а не по
+#     точной строке), тот же или первый протокол и транспорт, иначе auto. Вернётся сервер — вернётся и выбор.
+# Каждая перемена пишется предупреждением (у таймера обновления — в журнал) и строкой «внимание» в status.
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
@@ -2284,44 +2328,59 @@ def server_group(server):
     return axiom_classify(server.get("display", server["tag"]))
 
 
-def follow_server(ref, old_tag, servers):
-    """Сервера с тегом old_tag больше нет: куда переезжает выбор -> (тег, "renamed" | "changed") или (None, "lost").
+def server_country(server):
+    display = server.get("display", server["tag"])
+    group = axiom_classify(display)
+    return country_code(group[0] if group else display)
 
-    ref — сохранённый server_ref (None у состояния от версий до 1.4.1: тогда остаётся только сверка по имени).
+
+def follow_server(ref, old_tag, servers):
+    """Сервера old_tag в списке нет -> (тег, вид): "renamed" — тот же узел под новым именем; "changed" — замена
+    на время (тот же адрес или та же страна); (None, "lost") — замены нет, действует auto.
+
+    ref — сохранённый server_ref (у состояния до 1.4.1 его нет: тогда ищется только по стране).
     """
     ref = ref if isinstance(ref, dict) else {}
-    pool = [s for s in servers if s["source"] == ref["source"]] if ref.get("source") else list(servers)
-    group = axiom_classify(old_tag)
+    same_source = [s for s in servers if ref.get("source") and s["source"] == ref["source"]]
     refs = {s["tag"]: server_ref(s) for s in servers}
-
-    # 1. Тот же узел под новым именем. Одинаковые узлы взаимозаменяемы, поэтому хватит любого совпадения;
-    #    подписку могли пересоздать под другим именем — тогда ищем по всем.
+    group = axiom_classify(old_tag)
     if ref.get("key"):
-        same = [s for s in pool if refs[s["tag"]]["key"] == ref["key"]] or \
+        # подписку могли и пересоздать под другим именем — тогда ищем по всем
+        same = [s for s in same_source if refs[s["tag"]]["key"] == ref["key"]] or \
                [s for s in servers if refs[s["tag"]]["key"] == ref["key"]]
         if same:
             return next((s for s in same if group and server_group(s) == group), same[0])["tag"], "renamed"
-    # 2. Имя по правилам AxiOm «Страна (аккаунт) [транспорт]»: та же страна, протокол и транспорт —
-    #    сменилась только часть в скобках.
-    named = [(server_group(s), s) for s in pool]
-    country = [(key, s) for key, s in named if group and key and key[0] == group[0]]
-    for key, s in country:
-        if key == group:
-            return s["tag"], "renamed"
-    # 3. Тот же адрес и то же имя хоста, но другие ключи или параметры. Только при единственном кандидате:
-    #    за одним адресом (CDN) бывает несколько стран, и ошибиться страной хуже, чем уйти в auto.
     if ref.get("route"):
-        routed = [s for s in pool if refs[s["tag"]]["route"] == ref["route"]]
+        # тот же адрес и имя хоста, другие ключи — только единственный кандидат: за одним адресом CDN бывает
+        # несколько стран, и ошибиться страной хуже, чем уйти в auto
+        routed = [s for s in (same_source or servers) if refs[s["tag"]]["route"] == ref["route"]]
         if len(routed) == 1:
-            return routed[0]["tag"], "renamed"
-    # 4. Как в приложении AxiOm: страна на месте — тот же протокол или первый по порядку приложения,
-    #    тот же транспорт или первый.
-    if country:
-        ordered = axiom_sorted([(key, s["tag"]) for key, s in country])
-        protocol = [(key, tag) for key, tag in ordered if key[1] == group[1]] or \
-                   [(key, tag) for key, tag in ordered if key[1] == ordered[0][0][1]]
-        return next((tag for key, tag in protocol if key[2] == group[2]), protocol[0][1]), "changed"
+            return routed[0]["tag"], "changed"
+    code = country_code(group[0] if group else old_tag)
+    if not code:
+        return None, "lost"
+    for pool in (same_source, servers):
+        candidates = [s for s in pool if server_country(s) == code]
+        if not candidates:
+            continue
+        typed = [(server_group(s), s["tag"]) for s in candidates if server_group(s)]
+        if group and typed:
+            # как в приложении AxiOm: тот же протокол или первый по его порядку, тот же транспорт или первый
+            ordered = axiom_sorted(typed)
+            protocol = [(key, tag) for key, tag in ordered if key[1] == group[1]] or \
+                       [(key, tag) for key, tag in ordered if key[1] == ordered[0][0][1]]
+            return next((tag for key, tag in protocol if key[2] == group[2]), protocol[0][1]), "changed"
+        return candidates[0]["tag"], "changed"
     return None, "lost"
+
+
+def effective_selection(st, servers):
+    """Сервер, который сейчас попадёт в конфиг -> (тег или "auto", вид замены или None). Ничего не меняет."""
+    tag = selected_server(st, servers)
+    if tag == "auto" or tag in {server["tag"] for server in servers}:
+        return tag, None
+    new, kind = follow_server(st.get("selected_ref"), tag, servers)
+    return new or "auto", kind
 
 
 SELECTION_KEYS = ("selected", "selected_ref", "selection_note", "axiom_extra")
@@ -2339,68 +2398,83 @@ def remember_choice(st, tag, servers):
 
 def selection_note_text(note):
     old, new = note.get("from"), note.get("to")
+    back = "когда он вернётся в подписку, вернётся и выбор"
     if note.get("kind") == "renamed":
         return f"сервер «{old}» в подписке теперь называется «{new}» — выбор перенесён"
     if note.get("kind") == "changed":
-        return f"сервера «{old}» больше нет — выбран «{new}» (та же страна)"
+        return f"сервера «{old}» сейчас нет в подписке — пока используется «{new}»; {back}"
     if note.get("kind") == "extra":
-        return f"своего сервера «{old}» больше нет — действует выбор приложения AxiOm"
-    return f"сервера «{old}» больше нет — включён auto (самый быстрый); выбрать сервер: {BASE} use"
+        return f"своего сервера «{old}» сейчас нет — пока действует выбор приложения AxiOm; {back}"
+    return f"сервера «{old}» сейчас нет в подписке — пока auto (самый быстрый); {back}"
 
 
 def reconcile_selection(st, servers):
-    """Сверяет сохранённый выбор со списком серверов. True — выбор в st изменился и его надо сохранить."""
+    """Сверяет сохранённый выбор со списком серверов. True — st изменился и выбор надо сохранить."""
     if not servers:
         return False
     by_tag = {s["tag"]: s for s in servers}
+    changed = False
 
-    def note(kind, old, new):
+    def set_note(kind, old, new):
+        nonlocal changed
+        note = st.get("selection_note")
+        if isinstance(note, dict) and (note.get("kind"), note.get("from"), note.get("to")) == (kind, old, new):
+            return       # о том же уже сказано: не повторять на каждой сборке
         st["selection_note"] = {"at": int(time.time()), "kind": kind, "from": old, "to": new}
         warn("выбор сервера: " + selection_note_text(st["selection_note"]))
+        changed = True
+
+    def returned(tag):
+        nonlocal changed
+        note = st.get("selection_note")
+        if isinstance(note, dict) and note.get("kind") != "renamed" and note.get("from") == tag:
+            st.pop("selection_note")
+            warn(f"выбор сервера: «{tag}» снова в подписке — выбор возвращён")
+            changed = True
+
+    def keep_ref(holder, key, server):
+        nonlocal changed
+        ref = server_ref(server)
+        if holder.get(key) != ref:
+            holder[key] = ref       # имя на месте — оно и главное, как в приложении; отпечаток обновляется
+            changed = True
 
     app = st.get("_axiom")
     if app and app["root"] and (options := axiom_options(servers)):
-        # выбор по странам хранит и чинит само приложение; у CLI здесь только «свой сервер» поверх него
+        # выбор по странам хранит приложение, и axiom_chosen ищет его страну сам; у CLI здесь только
+        # «свой сервер», выбранный поверх выбора приложения
         extra = st.get("axiom_extra")
         if not isinstance(extra, dict) or extra.get("prefs") != axiom_prefs_now(app):
             return False
         tag = extra.get("tag")
         if tag in by_tag:
-            ref = server_ref(by_tag[tag])
-            if extra.get("ref") == ref:
-                return False
-            extra["ref"] = ref
-            return True
+            keep_ref(extra, "ref", by_tag[tag])
+            returned(tag)
+            return changed
         own = set(axiom_extras(servers, options))
         new, kind = follow_server(extra.get("ref"), tag, [s for s in servers if s["tag"] in own])
-        if new and kind == "renamed":
+        if kind == "renamed":
             extra.update(tag=new, ref=server_ref(by_tag[new]))
             st["selected"] = new
-            note("renamed", tag, new)
+            set_note("renamed", tag, new)
         else:
-            st.pop("axiom_extra")
-            note("extra", tag, None)
-        return True
+            set_note("extra", tag, None)
+        return changed
 
     tag = st["selected"]
     if tag == "auto":
         return st.pop("selected_ref", None) is not None
     if tag in by_tag:
-        ref = server_ref(by_tag[tag])
-        if st.get("selected_ref") == ref:
-            return False
-        st["selected_ref"] = ref        # имя на месте — оно и главное, как в приложении; отпечаток обновляется
-        return True
+        keep_ref(st, "selected_ref", by_tag[tag])
+        returned(tag)
+        return changed
     new, kind = follow_server(st.get("selected_ref"), tag, servers)
-    if new:
+    if kind == "renamed":
         st["selected"], st["selected_ref"] = new, server_ref(by_tag[new])
         if isinstance(st["latency"].get(tag), int):
             st["latency"].setdefault(new, st["latency"][tag])
-    else:
-        st["selected"] = "auto"
-        st.pop("selected_ref", None)
-    note(kind, tag, new or "auto")
-    return True
+    set_note(kind, tag, new or "auto")
+    return changed
 
 
 def save_selection(st):
@@ -2464,7 +2538,7 @@ def build_config(st, servers, *, tun=None, api_port=None, mixed_port=None, probe
         if best:
             auto.remove(best)
             auto.insert(0, best)
-    selected = selected_server(st, servers)
+    selected, _ = effective_selection(st, servers)
     selected = selected if selected in tags else "auto"
 
     have = {t: (RULESET_DIR / f"{t}.srs") for t in RULESETS}
@@ -3292,12 +3366,19 @@ def cmd_ls(st, a):
     now = current_node(st) if is_active(st) else None
     live = now.split(" → ")[-1] if now else None
     sel = st["selected"]
-    print(f"{'●' if sel == 'auto' else ' '}   0  auto" + (f"  → {live}" if sel == "auto" and live else ""))
+    stand_in, kind = effective_selection(st, servers)
+    if kind:
+        print(f"⚠ выбранного «{sel}» сейчас нет в подписке — пока {stand_in} (›); вернётся — вернётся и выбор")
+    else:
+        stand_in = None
+    mark = "●" if sel == "auto" else "›" if stand_in == "auto" else " "
+    print(f"{mark}   0  auto" + (f"  → {live}" if "auto" in (sel, stand_in) and live else ""))
     rx = st["settings"].get("auto_exclude")
     for i, s in enumerate(servers, 1):
         if a.filter and a.filter.lower() not in s["tag"].lower():
             continue
-        mark = "●" if s["tag"] == sel else ("›" if sel == "auto" and s["tag"] == live else " ")
+        mark = "●" if s["tag"] == sel else ("›" if s["tag"] == stand_in or
+                                            ("auto" in (sel, stand_in) and s["tag"] == live) else " ")
         ms = st["latency"].get(s["tag"])
         lat = "" if ms is None else ("  —" if ms < 0 else f"{ms:>5} мс")
         o = s["outbound"]
@@ -3643,7 +3724,7 @@ def cmd_pick(st, a):
         for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED,
                                curses.COLOR_CYAN), 1):
             curses.init_pair(i, c, -1)
-        sel = st["selected"] if st["selected"] in [it["tag"] for it in items] else "auto"
+        sel = st["selected"] if st["selected"] in [it["tag"] for it in items] else effective_selection(st, servers)[0]
         cur = next(i for i, it in enumerate(items) if it["tag"] == sel)
         top = 0
         while True:
@@ -4059,8 +4140,8 @@ def show_status(st):
           f" · маршрут {effective_route(st)}")
     servers = all_servers(st)
     selected = selected_server(st, servers) if st.get("_axiom") else st["selected"]
-    stale = selected != "auto" and servers and selected not in {server["tag"] for server in servers}
-    print(f"выбран:      {selected}" + ("  ⚠ в списке его нет — сейчас auto" if stale else ""))
+    now, kind = effective_selection(st, servers) if servers else (selected, None)
+    print(f"выбран:      {selected}" + (f"  ⚠ сейчас его нет в подписке — пока {now}" if kind else ""))
     note = st.get("selection_note")
     # о переименовании достаточно напоминать неделю; о замене сервера и об auto — пока выбор не сделают заново
     if isinstance(note, dict) and (note.get("kind") != "renamed" or time.time() - note.get("at", 0) < 7 * 86400):
